@@ -53,6 +53,17 @@ Fixes are applied during gameplay only; menus are never modified.
 
 To use it together with DXVK, ReShade or another `d3d11.dll`, rename the existing file to `d3d11_orig.dll` (or `dxvk_d3d11.dll` for DXVK) before copying, or set `ProxyDll=<file name>` in `tr_hud_fix.ini`. The fix then loads it automatically (chain loading).
 
+### Linux / Steam Deck (Proton)
+
+Not tested yet - feedback welcome. Use the same zip (the fix runs inside the Windows version of the game):
+
+1. Copy `d3d11.dll` and `tr_hud_fix.ini` into the game folder as above.
+2. In Steam: game > Properties > General > Launch options:
+   `WINEDLLOVERRIDES="d3d11=n,b" %command%`
+   (otherwise Proton ignores the `d3d11.dll` in the game folder).
+
+The native Linux version of the game (OpenGL) is not supported. To use the fix, force Proton under Properties > Compatibility.
+
 See [README.txt](README.txt) for details (English and German).
 
 ## Uninstall
@@ -65,6 +76,8 @@ Delete `d3d11.dll` and `tr_hud_fix.ini` from the game folder.
 |---|---|
 | Tested | Steam version; 16:9 (2560x1440, 1920x1080, 1280x720), 16:10 (1680x1050), 5:4 (1280x1024), 4:3 (1024x768, 800x600); exclusive fullscreen; Steam overlay |
 | Should work (untested) | Epic and GOG version; ultrawide 21:9 / 32:9; ReShade or DXVK via chain loading (`d3d11_orig.dll` or `ProxyDll=`); common overlays |
+| Untested, feedback welcome | Linux / Steam Deck via Proton (launch option `WINEDLLOVERRIDES="d3d11=n,b" %command%`, see [Install](#install)) |
+| Not supported | Native Linux version (OpenGL); Microsoft Store / Game Pass *Definitive Edition* (separate port) |
 | Not recommended | Special K (it hooks Direct3D 11 itself and may conflict) |
 | ASI loaders | Do not work with this game: `TombRaider.exe` loads `version.dll`, `winmm.dll` and `dinput8.dll` from System32. Use `d3d11.dll`. |
 

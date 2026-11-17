@@ -46,6 +46,14 @@ Install:
   2. Copy d3d11.dll and tr_hud_fix.ini into that folder.
   3. Start the game.
 
+Linux / Steam Deck (Proton) - not tested yet, feedback welcome:
+  1. Copy d3d11.dll and tr_hud_fix.ini into the game folder as above.
+  2. Steam: game > Properties > General > Launch options:
+       WINEDLLOVERRIDES="d3d11=n,b" %command%
+     (otherwise Proton ignores the d3d11.dll in the game folder).
+  The native Linux version of the game (OpenGL) is not supported. To use
+  the fix, force Proton under Properties > Compatibility.
+
 Uninstall:
   Delete d3d11.dll and tr_hud_fix.ini from the game folder.
 
@@ -181,6 +189,14 @@ Installation:
      Epic:  Bibliothek > ... > Verwalten > Installationsordner oeffnen.
   2. d3d11.dll und tr_hud_fix.ini in diesen Ordner kopieren.
   3. Spiel starten.
+
+Linux / Steam Deck (Proton) - noch nicht getestet, Rueckmeldungen willkommen:
+  1. d3d11.dll und tr_hud_fix.ini wie oben in den Spielordner kopieren.
+  2. Steam: Spiel > Eigenschaften > Allgemein > Startoptionen:
+       WINEDLLOVERRIDES="d3d11=n,b" %command%
+     (sonst ignoriert Proton die d3d11.dll im Spielordner).
+  Die native Linux-Version des Spiels (OpenGL) wird nicht unterstuetzt. Fuer
+  den Fix unter Eigenschaften > Kompatibilitaet Proton erzwingen.
 
 Deinstallation:
   d3d11.dll und tr_hud_fix.ini aus dem Spielordner loeschen.
