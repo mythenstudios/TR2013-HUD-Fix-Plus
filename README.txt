@@ -9,6 +9,12 @@ Supported game version:
   Tomb Raider (2013) / GOTY, current PC version: Patch 838,
   Steam build 9573671 (27 Sep 2022). Tested on Steam.
   - Epic Games Store: same version and same bugs; should work (not tested).
+  - GOG: not tested. If GOG has the same game version, it should work -
+    feedback welcome! If the bottom-right notifications end up in the wrong
+    place, press F9 to turn the fix off.
+  - Microsoft Store / Xbox app / Game Pass ("Definitive Edition"): not tested
+    and probably not supported - it is a separate port with different
+    shaders, so the fix most likely does nothing there. Feedback welcome.
   - Patch 829 / 838 before Sep 2022: same HUD behaviour; should work.
   - Steam beta branch "build743.0": does not have these bugs and does not
     need this fix.
@@ -93,7 +99,7 @@ Compatibility:
   Tested:            Steam version; 16:9 (2560x1440, 1920x1080, 1280x720),
                      16:10 (1680x1050), 5:4 (1280x1024), 4:3 (1024x768,
                      800x600); exclusive fullscreen; Steam overlay.
-  Should work:       Epic version; ultrawide 21:9 / 32:9; ReShade / DXVK via
+  Should work:       Epic and GOG version; ultrawide 21:9 / 32:9; ReShade / DXVK via
                      chain loading (see above); overlays (Discord,
                      RTSS/Afterburner, NVIDIA/AMD, OBS). Not tested yet -
                      feedback welcome.
@@ -118,7 +124,6 @@ Troubleshooting:
     (a known engine issue of the game since 2014, not caused by this fix).
   - EnableLogging=2 also writes a list of the HUD elements seen ([INV] lines)
     - this helps a lot with reports about misplaced HUD elements.
-  - Microsoft Store / Game Pass version: not tested.
 
 Credits / licences:
   TR2013 HUD Fix+ - MIT licence (licenses\TR_HUD_Fix_LICENSE.txt)
@@ -134,6 +139,13 @@ Unterstuetzte Spielversion:
   Steam-Build 9573671 (27.09.2022). Getestet mit Steam.
   - Epic Games Store: gleiche Version, gleiche Fehler; sollte funktionieren
     (nicht getestet).
+  - GOG: nicht getestet. Hat GOG denselben Spielstand, sollte es
+    funktionieren - Rueckmeldungen willkommen! Landen die Meldungen unten
+    rechts an der falschen Stelle, mit F9 den Fix abschalten.
+  - Microsoft Store / Xbox-App / Game Pass ("Definitive Edition"): nicht
+    getestet und vermutlich nicht unterstuetzt - eigene Umsetzung mit anderen
+    Shadern, der Fix tut dort sehr wahrscheinlich nichts. Rueckmeldungen
+    trotzdem willkommen.
   - Patch 829 / 838 vor Sept. 2022: gleiches HUD-Verhalten; sollte
     funktionieren.
   - Steam-Beta-Zweig "build743.0": hat diese Fehler nicht und braucht den Fix
@@ -223,15 +235,16 @@ Kompatibilitaet:
   Getestet:          Steam-Version; 16:9 (2560x1440, 1920x1080, 1280x720),
                      16:10 (1680x1050), 5:4 (1280x1024), 4:3 (1024x768,
                      800x600); exklusives Vollbild; Steam-Overlay.
-  Sollte gehen:      Epic-Version; Ultrawide 21:9 / 32:9; ReShade / DXVK per
+  Sollte gehen:      Epic- und GOG-Version; Ultrawide 21:9 / 32:9; ReShade / DXVK per
                      Chain-Loading (siehe oben); Overlays (Discord,
                      RTSS/Afterburner, NVIDIA/AMD, OBS). Noch nicht getestet -
                      Rueckmeldungen willkommen.
   Nicht empfohlen:   Special K (hakt sich selbst in Direct3D 11 ein; moegliche
                      Konflikte).
   Andere HUD-/Widescreen-Tools koennen das Layout veraendern: "Offset X"
-  anpassen (ShowAdvanced=1). Aendert ein kuenftiges Spiel-Update die HUD-Shader, tut der Fix
-  einfach nichts (kein Absturz).
+  anpassen (ShowAdvanced=1).
+  Aendert ein kuenftiges Spiel-Update die HUD-Shader, tut der Fix einfach
+  nichts (kein Absturz).
 
 Problembehebung:
   - Menue oeffnet nicht / Probleme mit dem Menue: MenuHotkey=0 in
@@ -250,7 +263,6 @@ Problembehebung:
     Spiels seit 2014, nicht durch diesen Fix verursacht).
   - EnableLogging=2 schreibt ausserdem eine Liste der gesehenen HUD-Elemente
     ([INV]-Zeilen) - das hilft sehr bei Berichten zu verschobenen HUD-Elementen.
-  - Microsoft-Store-/Game-Pass-Version: nicht getestet.
 
 Credits / Lizenzen:
   TR2013 HUD Fix+ - MIT-Lizenz (licenses\TR_HUD_Fix_LICENSE.txt)

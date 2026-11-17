@@ -16,6 +16,8 @@ Current version: **1.4.5**
 |---|---|
 | Steam, public branch (Patch 838, build 9573671) | Tested |
 | Epic Games Store | Same version and bugs, should work (not tested) |
+| GOG | Not tested. If GOG has the same game version, it should work. Feedback welcome! If the bottom-right notifications end up in the wrong place, press F9 to turn the fix off. |
+| Microsoft Store / Xbox app / Game Pass (*Definitive Edition*) | Not tested and probably not supported: the Definitive Edition is a separate port with different shaders, so the fix most likely does nothing there. Feedback welcome. |
 | Patch 829 (Oct 2021) / 838 (Nov 2021) before the Sep 2022 auth fix | Same HUD behaviour, should work |
 | Steam beta branch `build743.0` | Not affected, fix not needed |
 
@@ -62,7 +64,7 @@ Delete `d3d11.dll` and `tr_hud_fix.ini` from the game folder.
 | Status | Setups |
 |---|---|
 | Tested | Steam version; 16:9 (2560x1440, 1920x1080, 1280x720), 16:10 (1680x1050), 5:4 (1280x1024), 4:3 (1024x768, 800x600); exclusive fullscreen; Steam overlay |
-| Should work (untested) | Epic version; ultrawide 21:9 / 32:9; ReShade or DXVK via chain loading (`d3d11_orig.dll` or `ProxyDll=`); common overlays |
+| Should work (untested) | Epic and GOG version; ultrawide 21:9 / 32:9; ReShade or DXVK via chain loading (`d3d11_orig.dll` or `ProxyDll=`); common overlays |
 | Not recommended | Special K (it hooks Direct3D 11 itself and may conflict) |
 | ASI variant | Not shipped (see [Build](#build)) |
 
