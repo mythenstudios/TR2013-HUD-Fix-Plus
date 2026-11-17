@@ -107,8 +107,11 @@ Compatibility:
   Tested:            Steam version; 16:9 (2560x1440, 1920x1080, 1280x720),
                      16:10 (1680x1050), 5:4 (1280x1024), 4:3 (1024x768,
                      800x600); exclusive fullscreen; Steam overlay.
-  Should work:       Epic and GOG version; ultrawide 21:9 / 32:9; ReShade / DXVK via
-                     chain loading (see above); overlays (Discord,
+                     Test system: Windows 11 26H2, AMD Radeon RX 9070 XT
+                     (driver 26.11.1).
+  Should work:       Epic and GOG version; NVIDIA / Intel GPUs; Windows 10;
+                     ultrawide 21:9 / 32:9; ReShade / DXVK via chain
+                     loading (see above); overlays (Discord,
                      RTSS/Afterburner, NVIDIA/AMD, OBS). Not tested yet -
                      feedback welcome.
   Not recommended:   Special K (hooks Direct3D 11 itself; may conflict).
@@ -254,7 +257,10 @@ Kompatibilitaet:
   Getestet:          Steam-Version; 16:9 (2560x1440, 1920x1080, 1280x720),
                      16:10 (1680x1050), 5:4 (1280x1024), 4:3 (1024x768,
                      800x600); exklusives Vollbild; Steam-Overlay.
-  Sollte gehen:      Epic- und GOG-Version; Ultrawide 21:9 / 32:9; ReShade / DXVK per
+                     Testsystem: Windows 11 26H2, AMD Radeon RX 9070 XT
+                     (Treiber 26.11.1).
+  Sollte gehen:      Epic- und GOG-Version; NVIDIA-/Intel-Grafikkarten;
+                     Windows 10; Ultrawide 21:9 / 32:9; ReShade / DXVK per
                      Chain-Loading (siehe oben); Overlays (Discord,
                      RTSS/Afterburner, NVIDIA/AMD, OBS). Noch nicht getestet -
                      Rueckmeldungen willkommen.
