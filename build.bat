@@ -136,7 +136,9 @@ rem End-user ini: analysis logging off (also disables the F10 capture).
 powershell -NoProfile -Command "$t=[IO.File]::ReadAllText('tr_hud_fix.ini') -replace '(?m)^EnableLogging=1','EnableLogging=0'; [IO.File]::WriteAllText('%REL%\tr_hud_fix.ini',$t,[Text.Encoding]::ASCII)" || goto :release_failed
 findstr /r /c:"^EnableLogging=0" "%REL%\tr_hud_fix.ini" >nul || goto :release_failed
 for /f tokens^=2^ delims^=^" %%v in ('findstr /c:"kVersion =" src\dllmain.cpp') do set "VER=%%v"
-powershell -NoProfile -Command "Compress-Archive -Path '%REL%' -DestinationPath 'release\TR2013_HUD_Fix_Plus_v%VER%.zip' -Force" || goto :release_failed
+rem tar.exe (Windows 10+) writes zip entries with "/" separators, so the zip
+rem also extracts correctly on Linux / Steam Deck (Compress-Archive may use "\").
+"%SystemRoot%\System32\tar.exe" -a -c -f "release\TR2013_HUD_Fix_Plus_v%VER%.zip" -C release TR2013_HUD_Fix_Plus || goto :release_failed
 echo [OK] Release: %REL%\  and  release\TR2013_HUD_Fix_Plus_v%VER%.zip
 goto :done
 
