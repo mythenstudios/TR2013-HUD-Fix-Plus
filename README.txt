@@ -131,6 +131,9 @@ Credits / licences:
   The menu uses the Windows system font "Bahnschrift" if available (not
   included).
 
+  The fix is and stays free. If it helped you, you can support my work:
+  https://ko-fi.com/mythenstudios - thank you!
+
 
 DEUTSCH
 -------
@@ -269,3 +272,6 @@ Credits / Lizenzen:
   Dear ImGui von Omar Cornut - MIT-Lizenz (licenses\DearImGui_LICENSE.txt)
   Das Menue nutzt, falls vorhanden, die Windows-Systemschrift "Bahnschrift"
   (nicht enthalten).
+
+  Der Fix ist und bleibt kostenlos. Wenn er dir geholfen hat, kannst du meine
+  Arbeit unterstuetzen: https://ko-fi.com/mythenstudios - danke!

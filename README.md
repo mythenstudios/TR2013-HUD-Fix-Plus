@@ -109,3 +109,7 @@ The log size is limited by `MaxLogMB` (default 50 MB).
 
 - TR2013 HUD Fix+: MIT, see [LICENSE](LICENSE).
 - Dear ImGui: MIT, © Omar Cornut, see `third_party/imgui/LICENSE.txt`.
+
+---
+
+The fix is and stays free. If it helped you, you can support my work on [Ko-fi](https://ko-fi.com/mythenstudios). Thank you!
