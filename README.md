@@ -112,4 +112,11 @@ The log size is limited by `MaxLogMB` (default 50 MB).
 
 ---
 
-The fix is and stays free. If it helped you, you can support my work on [Ko-fi](https://ko-fi.com/mythenstudios). Thank you!
+The fix is and stays free. If it helped you, a coffee helps me keep building. Thank you!
+
+<a href="https://ko-fi.com/mythenstudios">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="branding/graphics/kofi-dark.svg">
+    <img alt="Support on Ko-fi" src="branding/graphics/kofi-light.svg" height="40">
+  </picture>
+</a>
