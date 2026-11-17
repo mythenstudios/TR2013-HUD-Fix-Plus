@@ -1,0 +1,40 @@
+# Build output
+build/
+release/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Local machine configuration (contains personal paths)
+build.local.cmd
+
+# Analysis logs and test screenshots (contain local paths / third-party images)
+*.log
+logs_*/
+screens/
+
+# Local AI tooling / private project notes (contain personal paths)
+CLAUDE.md
+.claude/
+
+# Editor / OS clutter
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+
+# Local test tools (downloaded, not part of the project)
+tools/
+
+# Local backups of earlier builds
+archive/
+
+# Local log analysis scripts
+analysis/
+
+# Local handoff notes (contain personal paths)
+HANDOFF.md
