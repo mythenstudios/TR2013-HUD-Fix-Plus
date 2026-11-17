@@ -2,7 +2,7 @@
 rem ===========================================================================
 rem  TR2013 HUD Fix+ (TR_HUD_Fix) - build script (32-bit x86, MSVC, static CRT /MT)
 rem
-rem  Usage:  build.bat           build build\d3d11.dll and build\TR_HUD_Fix.asi
+rem  Usage:  build.bat           build build\d3d11.dll
 rem          build.bat deploy    build, then copy d3d11.dll + tr_hud_fix.ini into
 rem                              the game folder (env TR_GAME_DIR or build.local.cmd)
 rem          build.bat release   build, then assemble release\ + zip (logging off)
@@ -58,11 +58,9 @@ if /i not "%VSCMD_ARG_TGT_ARCH%"=="x86" (
 echo [INFO] Toolchain target: %VSCMD_ARG_TGT_ARCH%
 
 rem ---------------------------------------------------------------------------
-rem  2. Build both targets (separate object folders)
+rem  2. Build the proxy
 rem ---------------------------------------------------------------------------
 if not exist "build\obj_proxy" mkdir "build\obj_proxy"
-if errorlevel 1 goto :build_failed
-if not exist "build\obj_asi" mkdir "build\obj_asi"
 if errorlevel 1 goto :build_failed
 if not exist "build\obj_imgui" mkdir "build\obj_imgui"
 if errorlevel 1 goto :build_failed
@@ -73,7 +71,7 @@ if not exist "%IMGUI_DIR%\imgui.cpp" (
     exit /b 2
 )
 
-rem Dear ImGui (third-party, unchanged) - compiled once, linked into both targets.
+rem Dear ImGui (third-party, unchanged).
 set "IMGUI_FLAGS=/nologo /c /O2 /MT /std:c++17 /EHsc /W3 /utf-8 /DWIN32 /D_WINDOWS /DNDEBUG /DUNICODE /D_UNICODE /DIMGUI_IMPL_WIN32_DISABLE_GAMEPAD /I%IMGUI_DIR% /I%IMGUI_DIR%\backends"
 echo.
 echo [BUILD] Dear ImGui -^> build\obj_imgui
@@ -92,12 +90,7 @@ cl %CFLAGS% /DTRHF_PROXY /LD src\dllmain.cpp %IMGUI_OBJS% /Fo"build\obj_proxy\\"
 if errorlevel 1 goto :build_failed
 
 echo.
-echo [BUILD] build\TR_HUD_Fix.asi  (ASI plugin)
-cl %CFLAGS% /DTRHF_ASI /LD src\dllmain.cpp %IMGUI_OBJS% /Fo"build\obj_asi\\" /Fe"build\TR_HUD_Fix.asi" /link /MACHINE:X86 %LIBS%
-if errorlevel 1 goto :build_failed
-
-echo.
-echo [OK] Build finished: build\d3d11.dll, build\TR_HUD_Fix.asi
+echo [OK] Build finished: build\d3d11.dll
 
 if /i "%MODE%"=="release" goto :release
 if /i not "%MODE%"=="deploy" goto :done
@@ -134,8 +127,6 @@ rem ---------------------------------------------------------------------------
 :release
 set "REL=release\TR2013_HUD_Fix_Plus"
 if exist "release" rmdir /s /q "release"
-rem Note: TR_HUD_Fix.asi is NOT shipped - TombRaider.exe resolves version.dll,
-rem winmm.dll and dinput8.dll from System32, so ASI loaders cannot start there.
 mkdir "%REL%\licenses" || goto :release_failed
 copy /y "build\d3d11.dll" "%REL%\d3d11.dll" >nul || goto :release_failed
 copy /y "README.txt" "%REL%\README.txt" >nul || goto :release_failed
@@ -169,7 +160,7 @@ exit /b 3
 :deploy_foreign
 echo [ERROR] "%GAME_DIR%\d3d11.dll" exists and is NOT TR2013 HUD Fix+ (DXVK/ReShade/other?).
 echo         Aborting - foreign DLLs are never overwritten. Rename it to
-echo         d3d11_orig.dll (auto chain-loading) or use TR_HUD_Fix.asi instead.
+echo         d3d11_orig.dll (auto chain-loading).
 exit /b 4
 
 :deploy_copy_failed
