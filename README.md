@@ -36,6 +36,8 @@ Fixes are applied during gameplay only; menus are never modified.
 
 ## Extras
 
+![TR2013 HUD Fix+ settings overlay](branding/graphics/tr2013-hudfix_menu.gif)
+
 - **In-game menu** (Dear ImGui, **INSERT**): adjust all settings live and save them to `tr_hud_fix.ini`.
 - **Quick toggle:** **F9** switches the fix on or off for comparison.
 - **FPS limiter and FPS overlay**, with frame time statistics and a graph.

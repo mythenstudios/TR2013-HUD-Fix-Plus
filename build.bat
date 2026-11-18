@@ -6,6 +6,8 @@ rem  Usage:  build.bat           build build\d3d11.dll
 rem          build.bat deploy    build, then copy d3d11.dll + tr_hud_fix.ini into
 rem                              the game folder (env TR_GAME_DIR or build.local.cmd)
 rem          build.bat release   build, then assemble release\ + zip (logging off)
+rem          build.bat preview   dev tool only: build\menu_preview.exe (offline
+rem                              render of the in-game menu to BMP frames)
 rem
 rem  Never links d3d11.lib / dxgi.lib (the proxy would import itself).
 rem ===========================================================================
@@ -78,16 +80,21 @@ set "IMGUI_DEFS=/DIMGUI_IMPL_WIN32_DISABLE_GAMEPAD /DIMGUI_DISABLE_DEBUG_TOOLS /
 
 rem Dear ImGui (third-party, unchanged). /O1: size-optimised (menu code, not hot).
 set "IMGUI_FLAGS=/nologo /c /O1 /MT /std:c++17 /EHsc /W3 /utf-8 /DWIN32 /D_WINDOWS /DNDEBUG /DUNICODE /D_UNICODE %IMGUI_DEFS% /I%IMGUI_DIR% /I%IMGUI_DIR%\backends"
-echo.
-echo [BUILD] Dear ImGui -^> build\obj_imgui
-cl %IMGUI_FLAGS% %IMGUI_DIR%\imgui.cpp %IMGUI_DIR%\imgui_draw.cpp %IMGUI_DIR%\imgui_tables.cpp %IMGUI_DIR%\imgui_widgets.cpp %IMGUI_DIR%\backends\imgui_impl_dx11.cpp %IMGUI_DIR%\backends\imgui_impl_win32.cpp /Fo"build\obj_imgui\\"
-if errorlevel 1 goto :build_failed
-set "IMGUI_OBJS=build\obj_imgui\imgui.obj build\obj_imgui\imgui_draw.obj build\obj_imgui\imgui_tables.obj build\obj_imgui\imgui_widgets.obj build\obj_imgui\imgui_impl_dx11.obj build\obj_imgui\imgui_impl_win32.obj"
+set "IMGUI_SRCS=%IMGUI_DIR%\imgui.cpp %IMGUI_DIR%\imgui_draw.cpp %IMGUI_DIR%\imgui_tables.cpp %IMGUI_DIR%\imgui_widgets.cpp %IMGUI_DIR%\backends\imgui_impl_dx11.cpp %IMGUI_DIR%\backends\imgui_impl_win32.cpp"
 
 rem Our code: /W4. d3dcompiler_47/dwmapi (pulled in by ImGui) are
 rem delay-loaded so they are only touched when the menu is first opened.
 set "CFLAGS=/nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32 /D_WINDOWS /DNDEBUG /DUNICODE /D_UNICODE %IMGUI_DEFS% /I%IMGUI_DIR% /I%IMGUI_DIR%\backends"
 set "LIBS=user32.lib gdi32.lib d3dcompiler.lib delayimp.lib /DELAYLOAD:d3dcompiler_47.dll /DELAYLOAD:dwmapi.dll"
+
+rem Development tool (not shipped): offline menu preview EXE, own object dirs.
+if /i "%MODE%"=="preview" goto :preview
+
+echo.
+echo [BUILD] Dear ImGui -^> build\obj_imgui
+cl %IMGUI_FLAGS% %IMGUI_SRCS% /Fo"build\obj_imgui\\"
+if errorlevel 1 goto :build_failed
+set "IMGUI_OBJS=build\obj_imgui\imgui.obj build\obj_imgui\imgui_draw.obj build\obj_imgui\imgui_tables.obj build\obj_imgui\imgui_widgets.obj build\obj_imgui\imgui_impl_dx11.obj build\obj_imgui\imgui_impl_win32.obj"
 
 echo.
 echo [BUILD] build\d3d11.dll  (proxy)
@@ -145,6 +152,32 @@ rem tar.exe (Windows 10+) writes zip entries with "/" separators, so the zip
 rem also extracts correctly on Linux / Steam Deck (Compress-Archive may use "\").
 "%SystemRoot%\System32\tar.exe" -a -c -f "release\TR2013_HUD_Fix_Plus_v%VER%.zip" -C release TR2013_HUD_Fix_Plus || goto :release_failed
 echo [OK] Release: %REL%\  and  release\TR2013_HUD_Fix_Plus_v%VER%.zip
+goto :done
+
+rem ---------------------------------------------------------------------------
+rem  5. Offline menu preview (development tool, never shipped / deployed):
+rem     src\menu_preview.cpp includes dllmain.cpp with /DTRHF_MENU_PREVIEW and
+rem     renders the real ImGui menu offscreen at 2560x1440 into BMP frames.
+rem     Same flags/defines as the DLL, own object dirs, no exports.def, no
+rem     d3d11.lib (the system d3d11.dll is loaded at run time by full path).
+rem     Run:  build\menu_preview.exe [outdir]   (default build\preview)
+rem ---------------------------------------------------------------------------
+:preview
+if not exist "build\obj_preview" mkdir "build\obj_preview"
+if errorlevel 1 goto :build_failed
+if not exist "build\obj_imgui_preview" mkdir "build\obj_imgui_preview"
+if errorlevel 1 goto :build_failed
+echo.
+echo [BUILD] Dear ImGui -^> build\obj_imgui_preview
+cl %IMGUI_FLAGS% %IMGUI_SRCS% /Fo"build\obj_imgui_preview\\"
+if errorlevel 1 goto :build_failed
+set "IMGUI_PV_OBJS=build\obj_imgui_preview\imgui.obj build\obj_imgui_preview\imgui_draw.obj build\obj_imgui_preview\imgui_tables.obj build\obj_imgui_preview\imgui_widgets.obj build\obj_imgui_preview\imgui_impl_dx11.obj build\obj_imgui_preview\imgui_impl_win32.obj"
+echo.
+echo [BUILD] build\menu_preview.exe  (offline menu preview, not shipped)
+cl %CFLAGS% /DTRHF_MENU_PREVIEW src\menu_preview.cpp %IMGUI_PV_OBJS% /Fo"build\obj_preview\\" /Fe"build\menu_preview.exe" /link /MACHINE:X86 /SUBSYSTEM:CONSOLE %LIBS%
+if errorlevel 1 goto :build_failed
+echo.
+echo [OK] Build finished: build\menu_preview.exe  (run: build\menu_preview.exe [outdir])
 goto :done
 
 :release_failed

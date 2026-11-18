@@ -6354,8 +6354,17 @@ static UINT     g_perfPlotCount = 0;
 static bool     g_perfStatsWanted = false;
 static bool     g_perfStatsStale  = true;  // recompute at once when they become wanted
 
+#ifdef TRHF_MENU_PREVIEW
+// menu_preview.exe only: virtual clock for the frame-time statistics (0 = real QPC).
+static LONGLONG g_previewQpc = 0;
+#endif
+
 static LONGLONG QpcNow()
 {
+#ifdef TRHF_MENU_PREVIEW
+    if (g_previewQpc)
+        return g_previewQpc;
+#endif
     LARGE_INTEGER li;
     QueryPerformanceCounter(&li);
     return li.QuadPart;
@@ -7637,6 +7646,9 @@ enum MenuTab
     TAB_COUNT
 };
 static const char* const kTabNames[TAB_COUNT] = { "FIX", "PERFORMANCE", "DISPLAY", "HOTKEYS", "INFO" };
+#ifdef TRHF_MENU_PREVIEW
+static int g_previewTab = -1; // menu_preview.exe only: tab forced via ImGuiTabItemFlags_SetSelected (-1 = none)
+#endif
 
 static ImVec4 MenuWarnColor() { return ImVec4(150.0f / 255.0f, 40.0f / 255.0f, 30.0f / 255.0f, 1.0f); }
 
@@ -7739,17 +7751,15 @@ static void MenuTabPerf(float s)
         _snprintf_s(ov, sizeof(ov), _TRUNCATE, "%.2f / %.2f GB used - largest free block %llu MB",
                     static_cast<double>(usedMB) / 1024.0, static_cast<double>(g_memStat.totalMB) / 1024.0,
                     g_memStat.largestMB);
-        int pushed = 0;
+        // Neutral grey normally (ImGui's default bar colour is yellow and reads
+        // like a warning); amber when getting close, red when the warning is active.
+        ImVec4 barCol(0.40f, 0.42f, 0.38f, 1.0f);
         if (MemLow())
-        {
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.80f, 0.12f, 0.10f, 1.0f)); // red
-            pushed = 1;
-        }
+            barCol = ImVec4(0.72f, 0.10f, 0.08f, 1.0f); // red
         else if (g_memStat.availMB < 2ull * g_cfg.memWarnFreeMB)
-        {
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.90f, 0.75f, 0.10f, 1.0f)); // yellow
-            pushed = 1;
-        }
+            barCol = ImVec4(0.70f, 0.50f, 0.04f, 1.0f); // amber
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barCol);
+        const int pushed = 1;
         ImGui::TextUnformatted("Address space used");
         ImGui::ProgressBar(frac, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f), ov);
         if (pushed)
@@ -7844,12 +7854,14 @@ static void MenuTabInfo()
     // v1.4.6
     MemStatNoteMenu();
     if (g_memStat.valid)
-        ImGui::Text("Address space: %llu MB free of %llu MB, largest block %llu MB", g_memStat.availMB,
-                    g_memStat.totalMB, g_memStat.largestMB);
-    ImGui::TextDisabled("Map safety: stale drops %ld, guard hits %ld, re-arms Map/Unmap/Upd %ld/%ld/%ld",
-                        static_cast<LONG>(g_fixStaleDrops), static_cast<LONG>(g_scratchGuardHits),
-                        static_cast<LONG>(g_rearmCount[VT_Map]), static_cast<LONG>(g_rearmCount[VT_Unmap]),
-                        static_cast<LONG>(g_rearmCount[VT_UpdateSubresource]));
+    {
+        ImGui::Text("Address space: %llu / %llu MB free", g_memStat.availMB, g_memStat.totalMB);
+        ImGui::Text("Largest free block: %llu MB", g_memStat.largestMB);
+    }
+    ImGui::TextDisabled("Map safety: stale drops %ld, guard hits %ld", static_cast<LONG>(g_fixStaleDrops),
+                        static_cast<LONG>(g_scratchGuardHits));
+    ImGui::TextDisabled("Re-arms Map/Unmap/Upd: %ld/%ld/%ld", static_cast<LONG>(g_rearmCount[VT_Map]),
+                        static_cast<LONG>(g_rearmCount[VT_Unmap]), static_cast<LONG>(g_rearmCount[VT_UpdateSubresource]));
     if (g_gateMenuNow)
         ImGui::Text("Context: MENU (G%c)", g_gateReasonNow ? g_gateReasonNow : '?');
     else
@@ -7898,7 +7910,7 @@ static bool OverlayBuildMenu()
     }
 
     // Fixed width, automatic height up to the display height minus a margin.
-    const float winW = 420.0f * s;
+    const float winW = 470.0f * s; // v1.4.6: wide enough for all tab labels
     const float maxH = Max(200.0f * s, io.DisplaySize.y - 80.0f * s);
     if (g_ov.firstLayout)
     {
@@ -7941,7 +7953,12 @@ static bool OverlayBuildMenu()
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_TabHovered, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
             }
+#ifdef TRHF_MENU_PREVIEW
+            const bool selected = ImGui::BeginTabItem(kTabNames[i], nullptr,
+                                                      (g_previewTab == i) ? ImGuiTabItemFlags_SetSelected : 0);
+#else
             const bool selected = ImGui::BeginTabItem(kTabNames[i]);
+#endif
             if (current)
                 ImGui::PopStyleColor(2);
             if (selected)

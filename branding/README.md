@@ -73,3 +73,12 @@ Only use pairs that show **released** improvements. No screenshots containing th
 - Logo: four safe-zone corner brackets around a white "H+" badge with a cut corner and a crimson underline.
 - Font: Barlow Semi Condensed 500/600/700 (SIL Open Font License, see `tools/fonts/OFL-LICENSE.txt`), embedded in the SVGs as base64.
 - Randomness (scratches, contour lines) uses fixed seeds → regenerating produces identical images.
+
+## Settings-menu showcase (GIF)
+
+The menu images are rendered by the mod's own overlay code outside the game (`build.bat preview` builds `build\menu_preview.exe`):
+
+```bash
+build\menu_preview.exe <frames_dir>
+python menu_gif.py <frames_dir> ../graphics     # tr2013-hudfix_menu.gif + one PNG per tab
+```
