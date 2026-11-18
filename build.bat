@@ -71,22 +71,27 @@ if not exist "%IMGUI_DIR%\imgui.cpp" (
     exit /b 2
 )
 
-rem Dear ImGui (third-party, unchanged).
-set "IMGUI_FLAGS=/nologo /c /O2 /MT /std:c++17 /EHsc /W3 /utf-8 /DWIN32 /D_WINDOWS /DNDEBUG /DUNICODE /D_UNICODE /DIMGUI_IMPL_WIN32_DISABLE_GAMEPAD /I%IMGUI_DIR% /I%IMGUI_DIR%\backends"
+rem ImGui config defines: MUST be identical for the ImGui objects and dllmain.cpp
+rem (they change struct layouts / declarations shared across translation units).
+rem No default shell handler -> shell32.dll is no longer imported.
+set "IMGUI_DEFS=/DIMGUI_IMPL_WIN32_DISABLE_GAMEPAD /DIMGUI_DISABLE_DEBUG_TOOLS /DIMGUI_DISABLE_OBSOLETE_FUNCTIONS /DIMGUI_DISABLE_DEMO_WINDOWS /DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS"
+
+rem Dear ImGui (third-party, unchanged). /O1: size-optimised (menu code, not hot).
+set "IMGUI_FLAGS=/nologo /c /O1 /MT /std:c++17 /EHsc /W3 /utf-8 /DWIN32 /D_WINDOWS /DNDEBUG /DUNICODE /D_UNICODE %IMGUI_DEFS% /I%IMGUI_DIR% /I%IMGUI_DIR%\backends"
 echo.
 echo [BUILD] Dear ImGui -^> build\obj_imgui
 cl %IMGUI_FLAGS% %IMGUI_DIR%\imgui.cpp %IMGUI_DIR%\imgui_draw.cpp %IMGUI_DIR%\imgui_tables.cpp %IMGUI_DIR%\imgui_widgets.cpp %IMGUI_DIR%\backends\imgui_impl_dx11.cpp %IMGUI_DIR%\backends\imgui_impl_win32.cpp /Fo"build\obj_imgui\\"
 if errorlevel 1 goto :build_failed
 set "IMGUI_OBJS=build\obj_imgui\imgui.obj build\obj_imgui\imgui_draw.obj build\obj_imgui\imgui_tables.obj build\obj_imgui\imgui_widgets.obj build\obj_imgui\imgui_impl_dx11.obj build\obj_imgui\imgui_impl_win32.obj"
 
-rem Our code: /W4. d3dcompiler_47/dwmapi/shell32 (pulled in by ImGui) are
+rem Our code: /W4. d3dcompiler_47/dwmapi (pulled in by ImGui) are
 rem delay-loaded so they are only touched when the menu is first opened.
-set "CFLAGS=/nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32 /D_WINDOWS /DNDEBUG /DUNICODE /D_UNICODE /I%IMGUI_DIR% /I%IMGUI_DIR%\backends"
-set "LIBS=user32.lib gdi32.lib d3dcompiler.lib delayimp.lib /DELAYLOAD:d3dcompiler_47.dll /DELAYLOAD:dwmapi.dll /DELAYLOAD:shell32.dll"
+set "CFLAGS=/nologo /O2 /MT /std:c++17 /EHsc /W4 /utf-8 /DWIN32 /D_WINDOWS /DNDEBUG /DUNICODE /D_UNICODE %IMGUI_DEFS% /I%IMGUI_DIR% /I%IMGUI_DIR%\backends"
+set "LIBS=user32.lib gdi32.lib d3dcompiler.lib delayimp.lib /DELAYLOAD:d3dcompiler_47.dll /DELAYLOAD:dwmapi.dll"
 
 echo.
 echo [BUILD] build\d3d11.dll  (proxy)
-cl %CFLAGS% /DTRHF_PROXY /LD src\dllmain.cpp %IMGUI_OBJS% /Fo"build\obj_proxy\\" /Fe"build\d3d11.dll" /link /MACHINE:X86 /DEF:src\exports.def %LIBS%
+cl %CFLAGS% /LD src\dllmain.cpp %IMGUI_OBJS% /Fo"build\obj_proxy\\" /Fe"build\d3d11.dll" /link /MACHINE:X86 /DEF:src\exports.def %LIBS%
 if errorlevel 1 goto :build_failed
 
 echo.

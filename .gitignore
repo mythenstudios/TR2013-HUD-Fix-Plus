@@ -28,7 +28,7 @@ Thumbs.db
 desktop.ini
 
 # Local test tools (downloaded, not part of the project)
-tools/
+/tools/
 
 # Local backups of earlier builds
 archive/
@@ -38,3 +38,6 @@ analysis/
 
 # Local handoff notes (contain personal paths)
 HANDOFF.md
+
+# Nexus-only page assets (screenshots, texts) - not part of the repo
+branding/nexus/

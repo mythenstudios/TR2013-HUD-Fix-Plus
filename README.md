@@ -6,7 +6,7 @@ Unofficial, multiplayer-safe community fix for HUD bugs in **Tomb Raider (2013) 
 
 Before this fix, the only workaround was to downgrade to Steam build 743, and that is not possible on Epic.
 
-Current version: **1.4.5**
+Current version: **1.4.6**
 
 ## Supported game version
 
@@ -40,6 +40,7 @@ Fixes are applied during gameplay only; menus are never modified.
 - **Quick toggle:** **F9** switches the fix on or off for comparison.
 - **FPS limiter and FPS overlay**, with frame time statistics and a graph.
 - **Borderless window and flip model** (experimental, need a game restart).
+- **Low-memory warning:** the game is a 32-bit program (about 4 GB of address space). When it runs low, a notice asks you to save and restart; the PERFORMANCE tab shows an address space bar. `[Memory]` in `tr_hud_fix.ini`.
 - **Hotkey rebinding** in the menu or in `tr_hud_fix.ini`, as key names (`F9`, `INSERT`, `PAGE UP`, `NUM 5`, ...) or virtual-key codes (`MenuHotkey=0` disables the menu completely).
 - **Advanced sliders** for the bottom-right notification offset/scale are hidden by default (the values are calibrated); `ShowAdvanced=1` in `[Menu]` shows them.
 
@@ -117,6 +118,10 @@ Logging is off by default (`EnableLogging=0`: no log file and no diagnostic work
 - **`EnableLogging=1`:** full analysis log. In modes 1 and 2, **F10** records 3 complete frames: every draw call, its shaders, constant-buffer contents and the decoded vertex bounds. This is how the bugs were located.
 
 The log size is limited by `MaxLogMB` (default 50 MB).
+
+**Crash report (always on):** if the game crashes, the fix writes `tr_hud_fix_crash.txt` to the game folder (with logging on, the report goes into `tr_hud_fix.log`). It records where the crash happened, the caller, the address space state and the last display events. Please attach it to crash reports.
+
+**Game crashes without the fix too.** Tomb Raider (2013) has crashed now and then since release. The most common remedy is to turn off Tessellation; if needed, also TressFX or reduce SSAA.
 
 ## License
 

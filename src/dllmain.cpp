@@ -1,11 +1,8 @@
 // =============================================================================
 //  TR2013 HUD Fix+ (TR_HUD_Fix) - Tomb Raider (2013) multiplayer-safe HUD position fix
 //
-//  One source, two targets (selected by preprocessor define):
-//    TRHF_PROXY -> build\d3d11.dll      (exports via src\exports.def, shipped)
-//    TRHF_ASI   -> build\TR_HUD_Fix.asi (no exports, hooks D3D11CreateDevice*
-//                                        in memory via Windows hotpatch prolog;
-//                                        built but not shipped)
+//  Single target: build\d3d11.dll (proxy, exports via src\exports.def). The
+//  former ASI variant was removed (ASI loaders cannot load into TombRaider.exe).
 //
 //  Architecture:
 //    * Proxy + chain loading: D3D11CreateDevice* are forwarded to ProxyDll
@@ -22,30 +19,37 @@
 //      bound for exactly one draw - game memory is never modified.
 //    * Dear ImGui in-game menu / FPS overlay (initialised and window subclass
 //      installed only on first use).
-//    * Diagnostics (log, F10 capture, watchdog, [INV], [MEM], crash handler)
-//      run only with EnableLogging=1/2. With EnableLogging=0 (default) every
-//      diagnostic path exits on a single flag check, no log file is created
-//      and no diagnostic container is allocated.
+//    * Diagnostics (log, F10 capture, watchdog, [INV], [MEM]) run only with
+//      EnableLogging=1/2 (crash handler: see below, always installed). With
+//      EnableLogging=0 (default) every diagnostic path exits on a single flag
+//      check, no log file is created and no diagnostic container is allocated.
+//    * v1.4.6 always-on crash report: a log-only vectored exception handler
+//      (never handles anything) is installed in every configuration. With a
+//      log file it writes [CRASH] lines into tr_hud_fix.log; with
+//      EnableLogging=0 it creates tr_hud_fix_crash.txt in the game folder
+//      (append, %TEMP% fallback) ONLY when a qualifying exception occurs (max.
+//      3 reports per process): fault module+offset (incl. execute at a null /
+//      unmapped address with the return address at [esp]), registers,
+//      address-space state, map-redirect/re-arm counters and the last
+//      DXGI/display/device events. Nothing is written otherwise.
+//    * v1.4.6 low address-space warning ([Memory] MemWarning): a time-sliced
+//      address-space walk from the Present hook (max. 64 VirtualQuery calls
+//      per frame, a new pass every 10 s), an ImGui toast when the 32-bit
+//      address space runs low (only if the overlay is already initialised).
 //
 //  Multiplayer rule: this code NEVER touches code or data of TombRaider.exe,
 //  steam_api.dll or EOSSDK-Win32-Shipping.dll (no IAT hooks in the game EXE).
-//  Only D3D11/DXGI object vtables are patched (and, in ASI mode, the hotpatch
-//  prolog of D3D11CreateDevice / D3D11CreateDeviceAndSwapChain in the loaded
-//  d3d11.dll).
+//  Only D3D11/DXGI object vtables are patched.
 //
-//  Build: x86 only, cl /O2 /MT /std:c++17 /EHsc /W4 - never link d3d11.lib or
+//  Build: x86 only, cl /O2 /MT /std:c++17 /EHsc /W4 (Dear ImGui: /O1; the
+//  IMGUI_DISABLE_* defines in build.bat must match for all translation
+//  units) - never link d3d11.lib or
 //  dxgi.lib (the proxy would import itself). All D3D entry points are resolved
 //  with GetProcAddress.
 // =============================================================================
 
 #if !defined(_M_IX86)
 #error "TR_HUD_Fix must be compiled for 32-bit x86 (use vcvars32.bat)."
-#endif
-#if !defined(TRHF_PROXY) && !defined(TRHF_ASI)
-#error "Define exactly one of TRHF_PROXY or TRHF_ASI."
-#endif
-#if defined(TRHF_PROXY) && defined(TRHF_ASI)
-#error "Define exactly one of TRHF_PROXY or TRHF_ASI."
 #endif
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -64,7 +68,6 @@
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
-#include <intrin.h>
 
 #include <cstdarg>
 #include <cstdint>
@@ -91,13 +94,9 @@
 extern "C" const char TRHF_Marker[] = "TR_HUD_Fix_Marker_v1";
 #pragma comment(linker, "/INCLUDE:_TRHF_Marker")
 
-static const char* const kVersion = "1.4.5";
+static const char* const kVersion = "1.4.6";
 
-#if defined(TRHF_PROXY)
 static const char* const kBuildTarget = "PROXY (d3d11.dll)";
-#else
-static const char* const kBuildTarget = "ASI (TR_HUD_Fix.asi)";
-#endif
 
 // =============================================================================
 //  Small helpers
@@ -246,8 +245,6 @@ static wchar_t g_selfPath[1024] = {};
 static wchar_t g_selfDir[1024]  = {};
 static wchar_t g_iniPath[1024]  = {};
 static wchar_t g_logPath[1024]  = {};
-static bool    g_extIsAsi       = false;  // runtime: module file extension is .asi
-static bool    g_asiMode        = false;  // effective mode
 static bool    g_active         = true;   // false if another TR_HUD_Fix instance owns this process
 static volatile bool g_shutdown = false;
 
@@ -321,6 +318,10 @@ struct Config
     bool     borderless         = false;
     bool     flipModel          = false;
     bool     allowTearing       = false;
+    // [Memory] (v1.4.6) low address-space warning
+    bool     memWarning         = true;
+    UINT     memWarnFreeMB      = 512;  // warn below this much free address space
+    UINT     memWarnBlockMB     = 96;   // ... or below this largest free block
 };
 static Config g_cfg;
 // Fix infrastructure (CB shadows, shader registry, own CB, menu gate) is active
@@ -359,43 +360,178 @@ static inline bool LoggingActive() { return g_logOn && !g_shutdown; }
 
 
 // =============================================================================
-//  Crash / exit diagnostics (only with a log file, EnableLogging=1 or 2)
+//  Crash / exit diagnostics
+//  v1.4.6: the crash handler runs in every configuration (log-only). With a
+//  log file the report goes into the log; otherwise into tr_hud_fix_crash.txt,
+//  created lazily on the first qualifying exception (never created otherwise).
 // =============================================================================
 static const UINT kEventRing = 16;
-static char g_eventRing[kEventRing][192] = {}; // last [DXGI]/[DISPLAY] log lines, g_logCs
+static char g_eventRing[kEventRing][192] = {}; // last [DXGI]/[DISPLAY] log lines + EventPush events, g_logCs
 static UINT g_eventPos = 0;
 static volatile LONG g_crashLogged = 0;
+static volatile LONG g_crashBusy   = 0;                     // one report at a time
+static HANDLE        g_crashFile   = INVALID_HANDLE_VALUE;  // tr_hud_fix_crash.txt (logging off only)
+static HANDLE        g_crashOut    = INVALID_HANDLE_VALUE;  // target of the current report
 
-// One line straight into the log WITHOUT g_logCs: on a crash or at process
+// One line straight into a file WITHOUT g_logCs: on a crash or at process
 // exit the lock may be owned by a crashed or already terminated thread.
 // Static buffer keeps the stack footprint small (stack-overflow handler).
-static void LogUnsafe(const char* fmt, ...)
+static void WriteLineUnsafeV(HANDLE h, const char* fmt, va_list ap)
 {
-    if (g_logFile == INVALID_HANDLE_VALUE || g_logStopped)
-        return;
     static char buf[768];
     const ULONGLONG t = GetTickCount64() - g_startTick;
     int p = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "[%7llu.%03llu] ", t / 1000ull, t % 1000ull);
     if (p < 0)
         p = 0;
-    va_list ap;
-    va_start(ap, fmt);
     int m = _vsnprintf_s(buf + p, sizeof(buf) - static_cast<size_t>(p) - 2, _TRUNCATE, fmt, ap);
-    va_end(ap);
     if (m < 0)
         m = static_cast<int>(strlen(buf + p));
     size_t len = static_cast<size_t>(p) + static_cast<size_t>(m);
     buf[len++] = '\r';
     buf[len++] = '\n';
     DWORD written = 0;
-    WriteFile(g_logFile, buf, static_cast<DWORD>(len), &written, nullptr);
-    g_logBytes += len;
+    WriteFile(h, buf, static_cast<DWORD>(len), &written, nullptr);
+    if (h == g_logFile)
+        g_logBytes += len;
 }
+
+static void LogUnsafe(const char* fmt, ...)
+{
+    if (g_logFile == INVALID_HANDLE_VALUE || g_logStopped)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    WriteLineUnsafeV(g_logFile, fmt, ap);
+    va_end(ap);
+}
+
+// Crash-report line into the current report target (log or crash file).
+static void CrashLine(const char* fmt, ...)
+{
+    if (g_crashOut == INVALID_HANDLE_VALUE)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    WriteLineUnsafeV(g_crashOut, fmt, ap);
+    va_end(ap);
+}
+
+// v1.4.6: event for the crash report ring, also with logging off (no file
+// I/O). Callers log the same text themselves if logging is active.
+static void EventPush(const char* fmt, ...)
+{
+    char line[192];
+    const ULONGLONG t = GetTickCount64() - g_startTick;
+    int p = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%7llu.%03llu] ", t / 1000ull, t % 1000ull);
+    if (p < 0)
+        p = 0;
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(line + p, sizeof(line) - static_cast<size_t>(p), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    EnterCriticalSection(&g_logCs);
+    strncpy_s(g_eventRing[g_eventPos], sizeof(g_eventRing[0]), line, _TRUNCATE);
+    g_eventPos = (g_eventPos + 1u) % kEventRing;
+    LeaveCriticalSection(&g_logCs);
+}
+
+// v1.4.6: user address space summary (VirtualQuery walk, no heap, no locks;
+// safe inside the crash handler). Synchronous full walk - used by the crash
+// handler only; the Present path uses the time-sliced MemWalkSlice. GetSystemInfo bounds = 0x10000..0xFFFEFFFF
+// for a LAA 32-bit process on 64-bit Windows.
+struct AddrSpaceInfo
+{
+    ULONGLONG committed, reserved, freeTotal, largestFree;
+};
+static void AddrSpaceWalk(AddrSpaceInfo* r)
+{
+    r->committed = r->reserved = r->freeTotal = r->largestFree = 0;
+    SYSTEM_INFO si = {};
+    GetSystemInfo(&si);
+    UINT_PTR a = reinterpret_cast<UINT_PTR>(si.lpMinimumApplicationAddress);
+    const UINT_PTR end = reinterpret_cast<UINT_PTR>(si.lpMaximumApplicationAddress);
+    while (a < end)
+    {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof(mbi)) || mbi.RegionSize == 0)
+            break;
+        if (mbi.State == MEM_FREE)
+        {
+            r->freeTotal += mbi.RegionSize;
+            r->largestFree = Max<ULONGLONG>(r->largestFree, mbi.RegionSize);
+        }
+        else if (mbi.State == MEM_COMMIT)
+        {
+            r->committed += mbi.RegionSize;
+        }
+        else
+        {
+            r->reserved += mbi.RegionSize;
+        }
+        const UINT_PTR next = reinterpret_cast<UINT_PTR>(mbi.BaseAddress) + mbi.RegionSize;
+        if (next <= a)
+            break; // wrapped at the top of the address space
+        a = next;
+    }
+}
+
+// Lazily opened crash file (append) - only called for a qualifying exception
+// with no log file open. Static buffers (stack-overflow handler).
+static HANDLE OpenCrashFile()
+{
+    if (g_crashFile != INVALID_HANDLE_VALUE)
+        return g_crashFile;
+    static wchar_t path[1024];
+    wcsncpy_s(path, g_selfDir, _TRUNCATE);
+    wcsncat_s(path, L"tr_hud_fix_crash.txt", _TRUNCATE);
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        // Game folder not writable -> %TEMP% (same fallback as the log).
+        const DWORD n = GetTempPathW(MAX_PATH, path);
+        if (n > 0 && n < MAX_PATH)
+        {
+            wcsncat_s(path, L"tr_hud_fix_crash.txt", _TRUNCATE);
+            h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                            nullptr);
+        }
+    }
+    g_crashFile = h;
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        g_crashOut = h;
+        CrashLine("==== TR2013 HUD Fix+ v%s %s - crash report %04u-%02u-%02u %02u:%02u:%02u (PID %lu) ====",
+                  kVersion, kBuildTarget, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                  GetCurrentProcessId());
+    }
+    return h;
+}
+
+// Module base name of an address ("?" if none). Static result buffer.
+static const char* CrashModName(const void* p, HMODULE* outMod)
+{
+    static char path[MAX_PATH];
+    HMODULE m = nullptr;
+    if (p)
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(p), &m);
+    *outMod = m;
+    if (!m || !GetModuleFileNameA(m, path, MAX_PATH))
+        return "?";
+    const char* b = strrchr(path, '\\');
+    return b ? b + 1 : path;
+}
+
+static void CrashReportExtra(); // counters + memory, defined after the fix section
 
 static const char* const kWatchedDlls[] = { "d3d11.dll", "dxgi.dll" };
 
 // Vectored handler: logs (max 3x) severe exceptions raised in our module, the
-// game EXE, d3d11.dll or dxgi.dll - then always continues the search, i.e.
+// game EXE, d3d11.dll or dxgi.dll, or (v1.4.6) at a null/unmapped EIP - then
+// always continues the search, i.e.
 // nothing is ever swallowed. First-chance exceptions the game handles itself
 // may therefore show up too (hence the cap).
 static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep)
@@ -415,48 +551,99 @@ static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep)
     default:
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    void* addr = ep->ExceptionRecord->ExceptionAddress;
+    // Cheap cap pre-check (read only) before any module lookups; the actual
+    // reservation below stays the InterlockedIncrement.
+    if (g_crashLogged >= 3)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    void* addr = er->ExceptionAddress;
     HMODULE mod = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(addr), &mod);
-    if (!mod)
-        return EXCEPTION_CONTINUE_SEARCH;
     static char modName[MAX_PATH];
+    bool nullEip = false;
+    if (!mod)
+    {
+        // v1.4.6: execute at a null/unmapped address (e.g. a call through a
+        // cleared function pointer) - the most common crash without a module.
+        const bool exec = code == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2 &&
+                          er->ExceptionInformation[0] == 8;
+        if (!exec && reinterpret_cast<UINT_PTR>(addr) >= 0x10000u)
+            return EXCEPTION_CONTINUE_SEARCH;
+        nullEip = true;
+    }
     char modPath[MAX_PATH] = {};
-    GetModuleFileNameA(mod, modPath, MAX_PATH);
-    const char* base = strrchr(modPath, '\\');
-    base = base ? base + 1 : modPath;
-    bool watched = (mod == g_hSelf || mod == GetModuleHandleW(nullptr));
-    for (size_t i = 0; !watched && i < ARRAYSIZE(kWatchedDlls); ++i)
-        watched = _stricmp(base, kWatchedDlls[i]) == 0;
-    if (!watched)
-        return EXCEPTION_CONTINUE_SEARCH;
+    const char* base = modPath;
+    if (!nullEip)
+    {
+        GetModuleFileNameA(mod, modPath, MAX_PATH);
+        base = strrchr(modPath, '\\');
+        base = base ? base + 1 : modPath;
+        bool watched = (mod == g_hSelf || mod == GetModuleHandleW(nullptr));
+        for (size_t i = 0; !watched && i < ARRAYSIZE(kWatchedDlls); ++i)
+            watched = _stricmp(base, kWatchedDlls[i]) == 0;
+        if (!watched)
+            return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (InterlockedIncrement(&g_crashLogged) > 3)
         return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedCompareExchange(&g_crashBusy, 1, 0) != 0)
+        return EXCEPTION_CONTINUE_SEARCH; // another thread is reporting (static buffers)
 
-    strcpy_s(modName, base);
+    // Target: the log if open, else the lazily created tr_hud_fix_crash.txt.
+    g_crashOut = (g_logFile != INVALID_HANDLE_VALUE && !g_logStopped) ? g_logFile : OpenCrashFile();
+    if (g_crashOut == INVALID_HANDLE_VALUE)
+    {
+        InterlockedExchange(&g_crashBusy, 0);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    strcpy_s(modName, nullEip ? "<no module>" : base);
     const UINT_PTR offset = reinterpret_cast<UINT_PTR>(addr) - reinterpret_cast<UINT_PTR>(mod);
-    LogUnsafe("[CRASH] code=0x%08lX addr=%p module=%s+0x%IX thread=%lu%s", code, addr, modName, offset,
-              GetCurrentThreadId(), mod == g_hSelf ? " (TR_HUD_Fix)" : "");
+    CrashLine("[CRASH] code=0x%08lX addr=%p module=%s+0x%IX thread=%lu%s", code, addr, modName, offset,
+              GetCurrentThreadId(), mod && mod == g_hSelf ? " (TR_HUD_Fix)" : "");
     const CONTEXT* c = ep->ContextRecord;
     if (c)
-        LogUnsafe("[CRASH] eip=%08lX esp=%08lX ebp=%08lX eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX",
+        CrashLine("[CRASH] eip=%08lX esp=%08lX ebp=%08lX eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX",
                   c->Eip, c->Esp, c->Ebp, c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi);
-    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+    if (code == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
     {
-        const ULONG_PTR kind = ep->ExceptionRecord->ExceptionInformation[0];
-        LogUnsafe("[CRASH] access violation %s %p", kind == 0 ? "reading" : (kind == 1 ? "writing" : "executing"),
-                  reinterpret_cast<void*>(ep->ExceptionRecord->ExceptionInformation[1]));
+        const ULONG_PTR kind = er->ExceptionInformation[0];
+        CrashLine("[CRASH] access violation %s %p",
+                  kind == 0 ? "reading" : (kind == 1 ? "writing" : (kind == 8 ? "executing (DEP)" : "?")),
+                  reinterpret_cast<void*>(er->ExceptionInformation[1]));
     }
-    LogUnsafe("[CRASH] last DXGI/DISPLAY events (oldest first):");
+    if (nullEip)
+    {
+        // The faulting call pushed its return address: [esp] = caller.
+        DWORD ret = 0;
+        SIZE_T got = 0;
+        if (c && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(static_cast<UINT_PTR>(c->Esp)), &ret,
+                                   sizeof(ret), &got) &&
+            got == sizeof(ret))
+        {
+            HMODULE rm = nullptr;
+            const char* rn = CrashModName(reinterpret_cast<const void*>(static_cast<UINT_PTR>(ret)), &rm);
+            CrashLine("[CRASH] null/unmapped eip: return address [esp]=%08lX -> %s+0x%IX%s", ret, rn,
+                      rm ? static_cast<UINT_PTR>(ret) - reinterpret_cast<UINT_PTR>(rm) : static_cast<UINT_PTR>(0),
+                      rm && rm == g_hSelf ? " (TR_HUD_Fix)" : "");
+        }
+        else
+        {
+            CrashLine("[CRASH] null/unmapped eip: [esp] not readable");
+        }
+    }
+    CrashReportExtra();
+    CrashLine("[CRASH] last DXGI/DISPLAY/DEVICE events (oldest first):");
     for (UINT i = 0; i < kEventRing; ++i)
     {
         const char* e = g_eventRing[(g_eventPos + i) % kEventRing];
         if (e[0])
-            LogUnsafe("[CRASH]   %s", e);
+            CrashLine("[CRASH]   %s", e);
     }
-    LogUnsafe("[CRASH] (first-chance: the game may still handle this exception)");
-    FlushFileBuffers(g_logFile);
+    CrashLine("[CRASH] (first-chance: the game may still handle this exception)");
+    FlushFileBuffers(g_crashOut);
+    InterlockedExchange(&g_crashBusy, 0);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -584,20 +771,6 @@ static void InitPaths()
     wcscat_s(g_iniPath, L"tr_hud_fix.ini");
     wcscpy_s(g_logPath, g_selfDir);
     wcscat_s(g_logPath, L"tr_hud_fix.log");
-}
-
-static void DetectMode()
-{
-    char a[MAX_PATH] = {};
-    const DWORD na = GetModuleFileNameA(g_hSelf, a, MAX_PATH);
-    g_extIsAsi = (na >= 4 && na < MAX_PATH && _stricmp(a + na - 4, ".asi") == 0);
-#if defined(TRHF_ASI)
-    // The ASI build has no D3D11 exports and can therefore only run in ASI mode.
-    g_asiMode = true;
-#else
-    // The proxy build switches to ASI mode if it was renamed to *.asi.
-    g_asiMode = g_extIsAsi;
-#endif
 }
 
 // Float from the ini; empty or unparsable -> def.
@@ -877,11 +1050,16 @@ static void ReadIni()
     g_startFlip        = g_cfg.flipModel;
     g_startTearing     = g_cfg.flipModel && g_cfg.allowTearing;
 
+    // [Memory] (v1.4.6) low address-space warning
+    g_cfg.memWarning     = GetPrivateProfileIntW(L"Memory", L"MemWarning", 1, g_iniPath) != 0;
+    g_cfg.memWarnFreeMB  = Min<UINT>(Max<UINT>(GetPrivateProfileIntW(L"Memory", L"MemWarnFreeMB", 512, g_iniPath), 16u), 3072u);
+    g_cfg.memWarnBlockMB = Min<UINT>(Max<UINT>(GetPrivateProfileIntW(L"Memory", L"MemWarnBlockMB", 96, g_iniPath), 4u), 2048u);
+
     u = GetPrivateProfileIntW(L"Capture", L"CaptureMaxLines", 400000, g_iniPath);
     g_cfg.captureMaxLines = Min<UINT>(Max<UINT>(u, 100u), 10000000u);
 }
 
-// Only one TR_HUD_Fix instance (proxy or ASI) may be active per process,
+// Only one TR_HUD_Fix instance may be active per process,
 // otherwise both would hook and fight over tr_hud_fix.log.
 static void AcquireInstance()
 {
@@ -1110,7 +1288,7 @@ struct OpenMap
 static SRWLOCK      g_stateLock = SRWLOCK_INIT;
 static TrackedState g_state     = {};
 static OpenMap      g_openMaps[kMaxOpenMaps] = {};
-static UINT         g_openMapCount = 0;
+static volatile LONG g_openMapCount = 0; // written under g_stateLock; read lock-free (Unmap early-out)
 static bool         g_capLogged[CAT_COUNT] = {};
 
 // Heap-allocated once and intentionally never freed: hooks may still be called
@@ -1409,6 +1587,7 @@ struct HookedTable
 {
     void** volatile vtbl;
     void* volatile  orig[VT_COUNT];
+    void* volatile  rejected[VT_COUNT]; // v1.4.6: last foreign entry Rearm left alone (no repeated ModuleOf)
     bool            writable; // RW memory -> re-arm without VirtualProtect
     // Fix state of the context that owns this table
     ID3D11Buffer*   fixCB;    // our dynamic 192-byte CB (game device only)
@@ -1488,12 +1667,27 @@ static inline void* OrigFor(ID3D11DeviceContext* ctx, UINT idx)
 static const UINT kDrawIdx[] = { VT_DrawIndexed, VT_Draw, VT_DrawIndexedInstanced, VT_DrawInstanced,
                                  VT_DrawIndexedInstancedIndirect, VT_DrawInstancedIndirect };
 static const UINT kDrawIdxCount = static_cast<UINT>(sizeof(kDrawIdx) / sizeof(kDrawIdx[0]));
+// v1.4.6: Rearm also covers Map / Unmap / UpdateSubresource (the runtime was
+// seen rewriting UpdateSubresource; Map/Unmap must stay paired for the
+// scratch redirect).
+static const UINT kRearmIdx[] = { VT_DrawIndexed, VT_Draw, VT_DrawIndexedInstanced, VT_DrawInstanced,
+                                  VT_DrawIndexedInstancedIndirect, VT_DrawInstancedIndirect,
+                                  VT_Map, VT_Unmap, VT_UpdateSubresource };
+static const UINT kRearmIdxCount = static_cast<UINT>(sizeof(kRearmIdx) / sizeof(kRearmIdx[0]));
 static volatile LONG g_rearmCount[VT_COUNT] = {};
+static volatile LONG g_rearmForeign = 0;          // v1.4.6: changed entries left alone (other module)
+static volatile LONG g_rearmForeignLogged = 0;
+static volatile LONG g_rearmMapLogged[3] = {};    // Map, Unmap, UpdateSubresource: logged once
+
+static HMODULE ModuleOf(const void* p); // object-table hooks section
 
 static const char* DrawIdxName(UINT idx)
 {
     switch (idx)
     {
+    case VT_Map:                          return "Map";
+    case VT_Unmap:                        return "Unmap";
+    case VT_UpdateSubresource:            return "UpdateSubresource";
     case VT_DrawIndexed:                  return "DrawIndexed";
     case VT_Draw:                         return "Draw";
     case VT_DrawIndexedInstanced:         return "DrawIndexedInstanced";
@@ -1548,6 +1742,76 @@ static void RearmNote(void** vtbl, UINT idx, void* newOrig)
         Log("[REARM] unique-entry cap (%u) reached - further new (idx, orig) pairs are not logged", kRearmLogCap);
 }
 
+// v1.4.6: "same module" test for Rearm without GetModuleHandleEx (loader lock)
+// per rewrite: image ranges [base, base+SizeOfImage) of the modules that hold
+// originals are cached (resolved once per module, max. 8, no heap).
+struct ModRange
+{
+    UINT_PTR lo, hi;
+};
+static ModRange g_modRanges[8] = {};
+static LONG     g_modRangeCount = 0;   // g_rearmLock
+static bool SameModuleCached(const void* cur, const void* prev)
+{
+    const UINT_PTR c = reinterpret_cast<UINT_PTR>(cur), p = reinterpret_cast<UINT_PTR>(prev);
+    AcquireSRWLockShared(&g_rearmLock);
+    for (LONG i = 0; i < g_modRangeCount; ++i)
+    {
+        if (p >= g_modRanges[i].lo && p < g_modRanges[i].hi)
+        {
+            const bool same = c >= g_modRanges[i].lo && c < g_modRanges[i].hi;
+            ReleaseSRWLockShared(&g_rearmLock);
+            return same;
+        }
+    }
+    ReleaseSRWLockShared(&g_rearmLock);
+    // Not cached: resolve prev's module once and remember its image range.
+    HMODULE m = ModuleOf(prev);
+    if (!m)
+        return ModuleOf(cur) == nullptr; // both outside any module (same rule as InstallClassHooks)
+    const unsigned char* base = reinterpret_cast<const unsigned char*>(m);
+    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const UINT_PTR lo = reinterpret_cast<UINT_PTR>(base), hi = lo + nt->OptionalHeader.SizeOfImage;
+    AcquireSRWLockExclusive(&g_rearmLock);
+    if (g_modRangeCount < static_cast<LONG>(ARRAYSIZE(g_modRanges)))
+    {
+        g_modRanges[g_modRangeCount].lo = lo;
+        g_modRanges[g_modRangeCount].hi = hi;
+        ++g_modRangeCount;
+    }
+    ReleaseSRWLockExclusive(&g_rearmLock);
+    return c >= lo && c < hi;
+}
+
+// Rare path of Rearm: entry idx no longer points to our hook. v1.4.6: the new
+// entry is only adopted as original if it lives in the same module as the
+// previous original (runtime rewrite). A foreign hook installed after ours is
+// left alone - chaining to it would recurse into ourselves. The rejected
+// pointer is cached so the module test runs once per new foreign value.
+static __declspec(noinline) void RearmEntry(HookedTable* t, void** vtbl, UINT idx, void* hook, void* cur)
+{
+    void* prev = t->orig[idx];
+    if (prev && !SameModuleCached(cur, prev))
+    {
+        t->rejected[idx] = cur;
+        InterlockedIncrement(&g_rearmForeign);
+        if (LoggingActive() && InterlockedExchange(&g_rearmForeignLogged, 1) == 0)
+            Log("[HOOK] context table %p [%u] %s replaced by another module (new %p, orig %p) - left alone "
+                "(further cases are counted only)",
+                static_cast<void*>(vtbl), idx, DrawIdxName(idx), cur, prev);
+        return;
+    }
+    t->orig[idx] = cur; // new original first, then the hook
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&vtbl[idx]), static_cast<LONG>(reinterpret_cast<LONG_PTR>(hook)));
+    InterlockedIncrement(&g_rearmCount[idx]);
+    RearmNote(vtbl, idx, cur);
+    const int mi = (idx == VT_Map) ? 0 : (idx == VT_Unmap ? 1 : (idx == VT_UpdateSubresource ? 2 : -1));
+    if (mi >= 0 && LoggingActive() && InterlockedExchange(&g_rearmMapLogged[mi], 1) == 0)
+        Log("[HOOK] runtime rewrote context table %p [%u] %s (new orig %p) - re-armed (logged once per entry)",
+            static_cast<void*>(vtbl), idx, DrawIdxName(idx), cur);
+}
+
 // Must only be called from inside a hook of THIS context, after the original
 // call (same thread as the runtime that may rewrite the table).
 static void Rearm(ID3D11DeviceContext* This)
@@ -1558,18 +1822,14 @@ static void Rearm(ID3D11DeviceContext* This)
     HookedTable* t = FindTable(vtbl);
     if (!t || !t->writable)
         return;
-    for (UINT k = 0; k < kDrawIdxCount; ++k)
+    for (UINT k = 0; k < kRearmIdxCount; ++k)
     {
-        const UINT idx = kDrawIdx[k];
+        const UINT idx = kRearmIdx[k];
         void* hook = g_hookByIdx[idx];
         void* cur = vtbl[idx];
-        if (cur == hook || !cur || !hook)
+        if (cur == hook || !cur || !hook || cur == t->rejected[idx])
             continue;
-        t->orig[idx] = cur; // new original first, then the hook
-        InterlockedExchange(reinterpret_cast<volatile LONG*>(&vtbl[idx]),
-                            static_cast<LONG>(reinterpret_cast<LONG_PTR>(hook)));
-        InterlockedIncrement(&g_rearmCount[idx]);
-        RearmNote(vtbl, idx, cur);
+        RearmEntry(t, vtbl, idx, hook, cur);
     }
 }
 
@@ -1816,15 +2076,48 @@ static void PollFix(); // fix section (F9 toggle + statistics)
 
 // =============================================================================
 //  v1.3.0 memory telemetry ([MEM], EnableLogging 1 or 2)
-//  No allocations: K32GetProcessMemoryInfo (kernel32, no psapi.lib) + one
-//  VirtualQuery walk over the user address space (~ms, once per MemLogSec).
+//  No allocations: K32GetProcessMemoryInfo (kernel32, no psapi.lib) +
+//  GlobalMemoryStatusEx. v1.4.6: largest free region, walk time and region
+//  count come from the last completed time-sliced address-space walk (see
+//  MemWalkSlice) - no own VirtualQuery walk.
 // =============================================================================
 typedef BOOL (WINAPI* TRHF_PFN_K32GetProcessMemoryInfo)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
 static volatile LONG g_memLastTick = 0;
 static volatile LONG g_memStarted  = 0;
+static volatile LONG g_memFirstTry = 0; // GetTickCount|1 of the first [MEM] attempt (waits for a walk)
 
-// Formats "[MEM] t=... private=... MB working=... MB vsize=... MB largestFree=... MB ours=... KB".
-// Safe at process exit (kernel32 calls only, no heap, no locks).
+// v1.4.6: result of the last completed incremental walk, published by the game
+// Present thread with a sequence counter (odd = being written, 0 = nothing
+// yet). Readers: [MEM] telemetry (any Present thread, process exit).
+static volatile LONG      g_memPubSeq     = 0;
+static volatile ULONGLONG g_memPubLargest = 0; // bytes
+static volatile LONG      g_memPubWalkUs  = 0; // summed slice time of the pass
+static volatile LONG      g_memPubRegions = 0;
+
+// Bounded retries: never spins (e.g. at process exit with a killed writer).
+static bool MemPubRead(ULONGLONG* largest, LONG* walkUs, LONG* regions)
+{
+    for (int tries = 0; tries < 8; ++tries)
+    {
+        const LONG s1 = g_memPubSeq;
+        if (s1 == 0)
+            return false;
+        if (s1 & 1)
+        {
+            YieldProcessor();
+            continue;
+        }
+        *largest = g_memPubLargest;
+        *walkUs  = g_memPubWalkUs;
+        *regions = g_memPubRegions;
+        if (g_memPubSeq == s1)
+            return true;
+    }
+    return false;
+}
+
+// Formats "[MEM] t=... private=... MB working=... MB vsize=... MB largestFree=... MB ours=... KB
+// walk=... ms regions=...". Safe at process exit (kernel32 calls only, no heap, no locks).
 static void FormatMemLine(char* buf, size_t cap)
 {
     static TRHF_PFN_K32GetProcessMemoryInfo s_pmi = nullptr;
@@ -1845,42 +2138,50 @@ static void FormatMemLine(char* buf, size_t cap)
         workMB = static_cast<double>(pmc.WorkingSetSize) / (1024.0 * 1024.0);
     }
 
-    // Address space: committed + reserved total and the largest free region.
-    // GetSystemInfo bounds = 0x10000..0xFFFEFFFF for a LAA 32-bit process on 64-bit Windows.
-    SYSTEM_INFO si = {};
-    GetSystemInfo(&si);
-    ULONGLONG used = 0, largestFree = 0;
-    UINT_PTR a = reinterpret_cast<UINT_PTR>(si.lpMinimumApplicationAddress);
-    const UINT_PTR end = reinterpret_cast<UINT_PTR>(si.lpMaximumApplicationAddress);
-    while (a < end)
+    // vsize = committed + reserved = user address space minus free (current).
+    double vsizeMB = -1.0;
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalVirtual >= ms.ullAvailVirtual)
+        vsizeMB = static_cast<double>(ms.ullTotalVirtual - ms.ullAvailVirtual) / (1024.0 * 1024.0);
+
+    // Largest free region: last completed incremental walk.
+    char lf[32] = "n/a";
+    char wk[48] = "walk=n/a";
+    ULONGLONG largest = 0;
+    LONG walkUs = 0, regions = 0;
+    if (MemPubRead(&largest, &walkUs, &regions))
     {
-        MEMORY_BASIC_INFORMATION mbi = {};
-        if (!VirtualQuery(reinterpret_cast<LPCVOID>(a), &mbi, sizeof(mbi)) || mbi.RegionSize == 0)
-            break;
-        if (mbi.State == MEM_FREE)
-            largestFree = Max<ULONGLONG>(largestFree, mbi.RegionSize);
-        else
-            used += mbi.RegionSize;
-        const UINT_PTR next = reinterpret_cast<UINT_PTR>(mbi.BaseAddress) + mbi.RegionSize;
-        if (next <= a)
-            break; // wrapped at the top of the address space
-        a = next;
+        _snprintf_s(lf, sizeof(lf), _TRUNCATE, "%.1f MB", static_cast<double>(largest) / (1024.0 * 1024.0));
+        _snprintf_s(wk, sizeof(wk), _TRUNCATE, "walk=%.2f ms regions=%ld", static_cast<double>(walkUs) / 1000.0,
+                    regions);
     }
 
     const ULONGLONG t = GetTickCount64() - g_startTick;
     const LONG ours = g_oursBytes;
     _snprintf_s(buf, cap, _TRUNCATE,
-                "[MEM] t=%llu.%03llu private=%.1f MB working=%.1f MB vsize=%.1f MB largestFree=%.1f MB ours=%ld KB",
-                t / 1000ull, t % 1000ull, privMB, workMB, static_cast<double>(used) / (1024.0 * 1024.0),
-                static_cast<double>(largestFree) / (1024.0 * 1024.0), (ours > 0 ? ours : 0L) / 1024L);
+                "[MEM] t=%llu.%03llu private=%.1f MB working=%.1f MB vsize=%.1f MB largestFree=%s ours=%ld KB %s",
+                t / 1000ull, t % 1000ull, privMB, workMB, vsizeMB, lf, (ours > 0 ? ours : 0L) / 1024L, wk);
 }
 
-// From OnPresent: first line at the first logged Present, then every MemLogSec.
+// From OnPresent: first line at the first logged Present (v1.4.6: once the
+// first address-space walk completed, at most 15 s later), then every MemLogSec.
 static void MemPoll()
 {
     if (!g_cfg.memLogSec)
         return;
     const DWORD now = GetTickCount();
+    if (!g_memStarted && g_memPubSeq == 0)
+    {
+        const LONG first = g_memFirstTry;
+        if (!first)
+        {
+            InterlockedCompareExchange(&g_memFirstTry, static_cast<LONG>(now | 1u), 0);
+            return;
+        }
+        if (now - static_cast<DWORD>(first) < 15000u)
+            return;
+    }
     const LONG last = g_memLastTick;
     if (g_memStarted && now - static_cast<DWORD>(last) < g_cfg.memLogSec * 1000u)
         return;
@@ -1890,6 +2191,181 @@ static void MemPoll()
     char line[256];
     FormatMemLine(line, sizeof(line));
     Log("%s", line);
+}
+
+// =============================================================================
+//  v1.4.6 low address-space warning ([Memory] MemWarning)
+//  Game Present thread only (walk, check, menu and toast): no locks needed.
+//  The address space is walked incrementally (time-sliced): at most
+//  kMemWalkSlice VirtualQuery calls per Present, no heap. A new pass starts
+//  when the last completed one is >= 10 s old (>= 1 s while the menu shows the
+//  values). Nobody needs the values (MemWarning=0, no [MEM] logging, menu not
+//  showing them) -> only a timer compare, no walk.
+//  The full synchronous AddrSpaceWalk is used by the crash handler only.
+// =============================================================================
+struct MemStat
+{
+    bool      valid;
+    ULONGLONG totalMB, availMB, largestMB;
+    ULONGLONG tick; // GetTickCount64 of the last completed pass
+};
+static MemStat   g_memStat = {};
+static ULONGLONG g_memMenuTick = 0;    // last menu frame that showed the memory values
+static ULONGLONG g_memToastLast = 0;   // last time the toast was shown (0 = never)
+static ULONGLONG g_memToastUntil = 0;  // toast visible until this tick
+static char      g_memToastText[160] = {};
+
+// Incremental walk state (game Present thread only).
+static const UINT    kMemWalkSlice = 64; // VirtualQuery calls per Present
+static bool          g_walkRunning = false;
+static UINT_PTR      g_walkCursor  = 0;
+static UINT_PTR      g_walkEnd     = 0;
+static AddrSpaceInfo g_walkAcc     = {};
+static UINT          g_walkRegions = 0;
+static LONGLONG      g_walkTicks   = 0; // QPC ticks summed over the slices of the pass
+
+// Completed pass -> g_memStat (Present thread) + sequence-published values for [MEM].
+static void MemWalkPublish()
+{
+    const AddrSpaceInfo& as = g_walkAcc;
+    MEMORYSTATUSEX ms = {};
+    ms.dwLength = sizeof(ms);
+    g_memStat.largestMB = as.largestFree / (1024ull * 1024ull);
+    if (GlobalMemoryStatusEx(&ms))
+    {
+        g_memStat.totalMB = ms.ullTotalVirtual / (1024ull * 1024ull);
+        g_memStat.availMB = ms.ullAvailVirtual / (1024ull * 1024ull);
+    }
+    else
+    {
+        g_memStat.totalMB = (as.committed + as.reserved + as.freeTotal) / (1024ull * 1024ull);
+        g_memStat.availMB = as.freeTotal / (1024ull * 1024ull);
+    }
+    g_memStat.tick = GetTickCount64();
+    g_memStat.valid = true;
+
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    const LONGLONG us = f.QuadPart > 0 ? g_walkTicks * 1000000ll / f.QuadPart : 0ll;
+    InterlockedIncrement(&g_memPubSeq); // odd: writing
+    g_memPubLargest = as.largestFree;
+    g_memPubWalkUs  = static_cast<LONG>(Min<LONGLONG>(us, 0x7FFFFFFFll));
+    g_memPubRegions = static_cast<LONG>(g_walkRegions);
+    InterlockedIncrement(&g_memPubSeq); // even: stable
+}
+
+// One slice of the walk (starts a pass if none is running). Same accounting as
+// AddrSpaceWalk. Returns true when the pass completed and was published.
+static bool MemWalkSlice()
+{
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    if (!g_walkRunning)
+    {
+        SYSTEM_INFO si = {};
+        GetSystemInfo(&si);
+        g_walkCursor  = reinterpret_cast<UINT_PTR>(si.lpMinimumApplicationAddress);
+        g_walkEnd     = reinterpret_cast<UINT_PTR>(si.lpMaximumApplicationAddress);
+        g_walkAcc     = AddrSpaceInfo{};
+        g_walkRegions = 0;
+        g_walkTicks   = 0;
+        g_walkRunning = true;
+    }
+    bool done = false;
+    for (UINT i = 0; i < kMemWalkSlice; ++i)
+    {
+        if (g_walkCursor >= g_walkEnd)
+        {
+            done = true;
+            break;
+        }
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(g_walkCursor), &mbi, sizeof(mbi)) || mbi.RegionSize == 0)
+        {
+            done = true;
+            break;
+        }
+        ++g_walkRegions;
+        if (mbi.State == MEM_FREE)
+        {
+            g_walkAcc.freeTotal += mbi.RegionSize;
+            g_walkAcc.largestFree = Max<ULONGLONG>(g_walkAcc.largestFree, mbi.RegionSize);
+        }
+        else if (mbi.State == MEM_COMMIT)
+        {
+            g_walkAcc.committed += mbi.RegionSize;
+        }
+        else
+        {
+            g_walkAcc.reserved += mbi.RegionSize;
+        }
+        const UINT_PTR next = reinterpret_cast<UINT_PTR>(mbi.BaseAddress) + mbi.RegionSize;
+        if (next <= g_walkCursor)
+        {
+            done = true; // wrapped at the top of the address space
+            break;
+        }
+        g_walkCursor = next;
+    }
+    if (g_walkCursor >= g_walkEnd)
+        done = true;
+    QueryPerformanceCounter(&t1);
+    g_walkTicks += t1.QuadPart - t0.QuadPart;
+    if (!done)
+        return false;
+    g_walkRunning = false;
+    MemWalkPublish();
+    return true;
+}
+
+static bool MemLow()
+{
+    return g_memStat.valid && (g_memStat.availMB < g_cfg.memWarnFreeMB || g_memStat.largestMB < g_cfg.memWarnBlockMB);
+}
+
+// Menu frame showing the memory values: shows the last completed pass; while
+// shown, MemWarnPoll starts a new pass every second.
+static void MemStatNoteMenu()
+{
+    g_memMenuTick = GetTickCount64();
+}
+
+static inline bool MemToastActive()
+{
+    return g_memToastUntil != 0 && GetTickCount64() < g_memToastUntil;
+}
+
+// From the game Present hook: drives the incremental walk and evaluates the
+// warning once per completed pass; toast at most every 5 min.
+static void MemWarnPoll()
+{
+    if (!g_walkRunning)
+    {
+        const ULONGLONG t = GetTickCount64();
+        const bool menu = g_memMenuTick != 0 && t - g_memMenuTick < 2000ull;
+        if (!g_cfg.memWarning && !menu && !(LoggingActive() && g_cfg.memLogSec))
+            return; // nobody needs the values
+        if (g_memStat.valid && t - g_memStat.tick < (menu ? 1000ull : 10000ull))
+            return;
+    }
+    if (!MemWalkSlice())
+        return;
+    if (!g_cfg.memWarning || !MemLow())
+        return;
+    const ULONGLONG now = g_memStat.tick;
+    if (g_memToastLast && now - g_memToastLast < 300000ull)
+        return;
+    g_memToastLast = now;
+    g_memToastUntil = now + 10000ull;
+    _snprintf_s(g_memToastText, sizeof(g_memToastText), _TRUNCATE,
+                "Low memory: %llu MB free (largest block %llu MB). Save your game and restart soon to avoid a crash.",
+                g_memStat.availMB, g_memStat.largestMB);
+    EventPush("[MEM] low address space warning: %llu MB free, largest block %llu MB (limits %u/%u MB)",
+              g_memStat.availMB, g_memStat.largestMB, g_cfg.memWarnFreeMB, g_cfg.memWarnBlockMB);
+    if (LoggingActive())
+        Log("[MEM] low address space warning: %llu MB free of %llu MB, largest block %llu MB (limits MemWarnFreeMB=%u "
+            "MemWarnBlockMB=%u)",
+            g_memStat.availMB, g_memStat.totalMB, g_memStat.largestMB, g_cfg.memWarnFreeMB, g_cfg.memWarnBlockMB);
 }
 
 // Drops all VB/IB shadows (capture leftovers or the last sample frame), never
@@ -2522,6 +2998,8 @@ struct FixOpenMap
     const void* data;       // pointer the game writes to (our scratch if redirected)
     void*       real;       // v1.4.4: driver pointer when redirected, else nullptr
     bool        redirected; // v1.4.4: game writes into g_fixScratch[slot]
+    const ID3D11DeviceContext* ctx; // v1.4.6: context of the Map (identity only, no AddRef)
+    LONG        frame;      // v1.4.6: g_frameCount at Map time (a pair never spans a Present)
 };
 
 static volatile LONG g_fixRuntime   = 0; // EnableFix at start, toggled by ToggleHotkey
@@ -2532,9 +3010,22 @@ static FixOpenMap    g_fixMaps[kFixOpenMaps] = {};
 // block as pData; Unmap copies it to the driver pointer (write-only) and into
 // the shadow. Reading the driver pointer back (write-combined memory) cost
 // ~5 us per copy, ~10 ms per frame in busy scenes. Static, never grows.
-alignas(64) static unsigned char g_fixScratch[kFixOpenMaps][kFixCBBytes] = {};
+// v1.4.6: each slot is followed by a 64-byte guard (pattern checked at Unmap;
+// stride 256 keeps every data start 64-byte aligned).
+static const UINT  kScratchGuard   = 64;
+static const DWORD kScratchGuardDw = 0xFDFDFDFDu;
+alignas(64) static unsigned char g_fixScratch[kFixOpenMaps][kFixCBBytes + kScratchGuard] = {};
 static volatile LONG g_fixOpenCount = 0; // open entries in g_fixMaps (lock-free Unmap early-out)
 static LONG          g_redirCnt = 0;     // diagnostics: redirected maps (bench counter)
+static volatile LONG g_fixStaleDrops = 0;      // v1.4.6: open-map entries dropped without copy-back
+static volatile LONG g_scratchGuardHits = 0;   // v1.4.6: scratch guard found overwritten
+static volatile LONG g_scratchGuardLogged = 0;
+
+static void ScratchGuardInit()
+{
+    for (UINT i = 0; i < kFixOpenMaps; ++i)
+        memset(&g_fixScratch[i][kFixCBBytes], 0xFD, kScratchGuard);
+}
 static volatile LONG g_fixStampCounter = 0;
 static volatile LONG g_fixCount     = 0;  // corrected draws since the last stats line
 static volatile LONG g_fixTotal     = 0;  // corrected draws (session, for the menu rate)
@@ -2620,6 +3111,37 @@ static bool FixShadowGet(const void* buf, float* out)
     return ok;
 }
 
+// Called with g_fixLock held exclusively.
+static void FixShadowInvalidateLocked(const void* buf)
+{
+    for (UINT i = 0; i < kFixShadows; ++i)
+    {
+        if (g_fixShadows[i].buf == buf)
+        {
+            g_fixShadows[i].valid = false;
+            break;
+        }
+    }
+}
+
+// v1.4.6: drops all open-map entries WITHOUT copy-back (HUD set cleared, perf
+// mode change) and invalidates their shadows. Map/Unmap pairs never span a
+// Present, so no legitimately open map is affected.
+static void FixMapsReset()
+{
+    AcquireSRWLockExclusive(&g_fixLock);
+    for (UINT i = 0; i < kFixOpenMaps; ++i)
+    {
+        if (g_fixMaps[i].res)
+        {
+            FixShadowInvalidateLocked(g_fixMaps[i].buf);
+            g_fixMaps[i] = FixOpenMap{};
+        }
+    }
+    InterlockedExchange(&g_fixOpenCount, 0);
+    ReleaseSRWLockExclusive(&g_fixLock);
+}
+
 // "HUD buffer set": buffers that were bound to VS slot 0 for a HUD draw. Only
 // these are mirrored (pointer compare first - no QI for other buffers). The
 // first HUD draw of a new buffer therefore stays uncorrected (no shadow yet).
@@ -2657,6 +3179,7 @@ static void HudSetClear()
         g_hudSet[i] = nullptr;
     InterlockedExchange(&g_hudSetNext, 0);
     InterlockedExchange(&g_hudSetUsed, 0);
+    FixMapsReset(); // v1.4.6
 }
 
 // True for a 192-byte constant buffer; *buf receives its identity.
@@ -2676,8 +3199,11 @@ static bool PerfWantHook(LONG mode, UINT idx);
 
 // canRedirect: our Unmap hook is installed on this context (else never redirect,
 // the game's data would not reach the driver).
-static void FixOnMap(ID3D11Resource* res, UINT sub, D3D11_MAP mapType, D3D11_MAPPED_SUBRESOURCE* m,
-                     bool canRedirect)
+// v1.4.6: entries carry context + frame; an entry still open from an earlier
+// frame (its Unmap bypassed us) or re-mapped without an Unmap is dropped
+// without copy-back and its shadow invalidated (g_fixStaleDrops).
+static void FixOnMap(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT sub, D3D11_MAP mapType,
+                     D3D11_MAPPED_SUBRESOURCE* m, bool canRedirect)
 {
     if (!res || sub != 0 || !m || !m->pData)
         return;
@@ -2687,21 +3213,46 @@ static void FixOnMap(ID3D11Resource* res, UINT sub, D3D11_MAP mapType, D3D11_MAP
     if (!IsFixCB(res, &buf))
         return;
     ++g_mapHitCnt;
+    const LONG frame = g_frameCount;
+    LONG stale = 0;
     AcquireSRWLockExclusive(&g_fixLock);
     FixOpenMap* target = nullptr;
     UINT slot = 0;
+    bool same = false;
     for (UINT i = 0; i < kFixOpenMaps; ++i)
     {
         if (g_fixMaps[i].res == res)
         {
             target = &g_fixMaps[i];
             slot = i;
+            same = true;
             break;
         }
         if (!target && !g_fixMaps[i].res)
         {
             target = &g_fixMaps[i];
             slot = i;
+        }
+    }
+    if (same)
+    {
+        // Mapped again without an Unmap through our hook: the old entry is stale.
+        FixShadowInvalidateLocked(target->buf);
+        ++stale;
+    }
+    else if (!target)
+    {
+        // Table full: reclaim an entry left over from an earlier frame.
+        for (UINT i = 0; i < kFixOpenMaps; ++i)
+        {
+            if (g_fixMaps[i].frame != frame)
+            {
+                target = &g_fixMaps[i];
+                slot = i;
+                FixShadowInvalidateLocked(target->buf);
+                ++stale;
+                break;
+            }
         }
     }
     if (target)
@@ -2712,6 +3263,8 @@ static void FixOnMap(ID3D11Resource* res, UINT sub, D3D11_MAP mapType, D3D11_MAP
         target->buf = buf;
         target->real = nullptr;
         target->redirected = false;
+        target->ctx = ctx;
+        target->frame = frame;
         if (canRedirect && mapType == D3D11_MAP_WRITE_DISCARD && !CaptureActive())
         {
             target->real = m->pData;
@@ -2722,27 +3275,58 @@ static void FixOnMap(ID3D11Resource* res, UINT sub, D3D11_MAP mapType, D3D11_MAP
         target->data = m->pData;
     }
     ReleaseSRWLockExclusive(&g_fixLock);
+    if (stale)
+        InterlockedExchangeAdd(&g_fixStaleDrops, stale);
     if (!target)
         FixShadowInvalidate(buf); // no slot: never keep a stale matrix
+}
+
+// v1.4.6: rare path - scratch guard of slot overwritten (diagnostic only).
+static __declspec(noinline) void ScratchGuardReport(UINT slot)
+{
+    InterlockedIncrement(&g_scratchGuardHits);
+    if (InterlockedExchange(&g_scratchGuardLogged, 1) != 0)
+        return;
+    EventPush("[GUARD] scratch overrun slot %u", slot);
+    if (LoggingActive())
+        Log("[GUARD] scratch overrun slot %u (game wrote past 192 bytes of a redirected map; further hits are counted "
+            "only)",
+            slot);
 }
 
 // Unmap hook (BEFORE the original): copy the 192 bytes into the shadow.
 // v1.4.4: also the copy-back of redirected maps - must run for every Unmap
 // that reaches our hook (overlay, fix off, shutdown included).
-static void FixOnUnmap(ID3D11Resource* res, UINT sub)
+// v1.4.6: copy-back only if the entry belongs to this context and this frame.
+static void FixOnUnmap(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT sub)
 {
     if (!res || sub != 0 || g_fixOpenCount == 0)
         return;
     FixOpenMap om = {};
+    bool stale = false;
+    int guardSlot = -1;
     alignas(64) unsigned char tmp[kFixCBBytes];
+    const LONG frame = g_frameCount;
     AcquireSRWLockExclusive(&g_fixLock);
     for (UINT i = 0; i < kFixOpenMaps; ++i)
     {
         if (g_fixMaps[i].res == res)
         {
             om = g_fixMaps[i];
+            stale = (om.ctx != ctx || om.frame != frame);
             if (om.redirected)
-                memcpy(tmp, g_fixScratch[i], kFixCBBytes);
+            {
+                if (!stale)
+                    memcpy(tmp, g_fixScratch[i], kFixCBBytes);
+                unsigned char* guard = &g_fixScratch[i][kFixCBBytes];
+                if (*reinterpret_cast<const DWORD*>(guard) != kScratchGuardDw)
+                {
+                    memset(guard, 0xFD, kScratchGuard); // restore the pattern
+                    guardSlot = static_cast<int>(i);
+                }
+            }
+            if (stale)
+                FixShadowInvalidateLocked(om.buf);
             g_fixMaps[i] = FixOpenMap{};
             InterlockedDecrement(&g_fixOpenCount);
             break;
@@ -2751,6 +3335,13 @@ static void FixOnUnmap(ID3D11Resource* res, UINT sub)
     ReleaseSRWLockExclusive(&g_fixLock);
     if (!om.res)
         return;
+    if (guardSlot >= 0)
+        ScratchGuardReport(static_cast<UINT>(guardSlot));
+    if (stale)
+    {
+        InterlockedIncrement(&g_fixStaleDrops); // never write into `real` of a foreign/old map
+        return;
+    }
     if (om.redirected)
     {
         memcpy(om.real, tmp, kFixCBBytes); // write-only into the driver's memory
@@ -2765,15 +3356,28 @@ static void FixOnUnmap(ID3D11Resource* res, UINT sub)
 static void FixShadowInvalidate(const void* buf)
 {
     AcquireSRWLockExclusive(&g_fixLock);
-    for (UINT i = 0; i < kFixShadows; ++i)
-    {
-        if (g_fixShadows[i].buf == buf)
-        {
-            g_fixShadows[i].valid = false;
-            break;
-        }
-    }
+    FixShadowInvalidateLocked(buf);
     ReleaseSRWLockExclusive(&g_fixLock);
+}
+
+// v1.4.6 crash report part 2 (called from CrashVeh, no locks, no heap):
+// address space at crash time and the map-redirect / re-arm counters.
+static void CrashReportExtra()
+{
+    AddrSpaceInfo as;
+    AddrSpaceWalk(&as);
+    const double mb = 1024.0 * 1024.0;
+    CrashLine("[CRASH] address space: committed %.0f MB, reserved %.0f MB, free %.0f MB, largest free block %.0f MB",
+              static_cast<double>(as.committed) / mb, static_cast<double>(as.reserved) / mb,
+              static_cast<double>(as.freeTotal) / mb, static_cast<double>(as.largestFree) / mb);
+    CrashLine("[CRASH] fix: stale map drops %ld, scratch guard hits %ld, open maps %ld, frame %ld, perf mode %ld",
+              static_cast<LONG>(g_fixStaleDrops), static_cast<LONG>(g_scratchGuardHits),
+              static_cast<LONG>(g_fixOpenCount), static_cast<LONG>(g_frameCount), static_cast<LONG>(g_perfMode));
+    CrashLine("[CRASH] re-arms: Map %ld, Unmap %ld, UpdateSubresource %ld, draw %ld/%ld/%ld/%ld, foreign left alone %ld",
+              static_cast<LONG>(g_rearmCount[VT_Map]), static_cast<LONG>(g_rearmCount[VT_Unmap]),
+              static_cast<LONG>(g_rearmCount[VT_UpdateSubresource]), static_cast<LONG>(g_rearmCount[VT_DrawIndexed]),
+              static_cast<LONG>(g_rearmCount[VT_Draw]), static_cast<LONG>(g_rearmCount[VT_DrawIndexedInstanced]),
+              static_cast<LONG>(g_rearmCount[VT_DrawInstanced]), static_cast<LONG>(g_rearmForeign));
 }
 
 // UpdateSubresource hook (BEFORE the original): whole-buffer updates only.
@@ -3973,6 +4577,18 @@ static void PollFix()
     {
         const double secs = (now - g_fixStatTick) / 1000.0;
         g_fixStatTick = now;
+        // v1.4.6 map-redirect safety counters (session totals, logged when they change)
+        static LONG s_staleSeen = 0, s_guardSeen = 0;
+        const LONG stale = g_fixStaleDrops, guard = g_scratchGuardHits;
+        if (stale != s_staleSeen || guard != s_guardSeen)
+        {
+            s_staleSeen = stale;
+            s_guardSeen = guard;
+            Log("[FIX] map safety: stale map drops %ld, scratch guard hits %ld (session), re-arms Map %ld Unmap %ld "
+                "UpdateSubresource %ld",
+                stale, guard, static_cast<LONG>(g_rearmCount[VT_Map]), static_cast<LONG>(g_rearmCount[VT_Unmap]),
+                static_cast<LONG>(g_rearmCount[VT_UpdateSubresource]));
+        }
         const LONG npo = InterlockedExchange(&g_poCount, 0);
         if (npo > 0)
             Log("[FIX] %ld popup-origin fixes in last %.1f s", npo, secs);
@@ -4522,15 +5138,23 @@ static HRESULT STDMETHODCALLTYPE Hook_Map(ID3D11DeviceContext* This, ID3D11Resou
     const HRESULT hr = o(This, pResource, Subresource, MapType, MapFlags, pMappedResource);
     Rearm(This);
     if (g_fixInfra && SUCCEEDED(hr))
-        FixOnMap(pResource, Subresource, MapType, pMappedResource,
-                 g_perfMode == 0 || PerfWantHook(g_perfMode, VT_Unmap));
+    {
+        // v1.4.6: redirect only if THIS context's Unmap entry is our hook right
+        // now (read after Rearm) - else the copy-back would never run.
+        const bool unmapOurs = (*reinterpret_cast<void* const* const*>(This))[VT_Unmap] == g_hookByIdx[VT_Unmap] &&
+                               g_hookByIdx[VT_Unmap] != nullptr;
+        FixOnMap(This, pResource, Subresource, MapType, pMappedResource,
+                 unmapOurs && (g_perfMode == 0 || PerfWantHook(g_perfMode, VT_Unmap)));
+    }
     if (FAILED(hr) || !LoggingActive() || !pResource || Subresource != 0 || !pMappedResource ||
         !pMappedResource->pData)
         return hr;
     const bool cap = CaptureActive();
     // Watchdog sample frame: learned HUD VB/IB only (pointer compare, no QI otherwise)
     const bool samp = WatchSampling() && WatchBufContains(pResource);
-    if (g_cfg.cbDumpSamples == 0 && !cap && !samp)
+    // [CBDATA] samples exist only with EnableLogging=1 (CbNeedsDumpLocked); with
+    // EnableLogging=2 only a capture or a watchdog sample frame needs the rest.
+    if ((!g_logVerbose || g_cfg.cbDumpSamples == 0) && !cap && !samp)
         return hr;
 
     D3D11_BUFFER_DESC d = {};
@@ -4559,14 +5183,14 @@ static HRESULT STDMETHODCALLTYPE Hook_Map(ID3D11DeviceContext* This, ID3D11Resou
                 break;
             }
         }
-        if (!target && g_openMapCount < kMaxOpenMaps)
+        if (!target && static_cast<UINT>(g_openMapCount) < kMaxOpenMaps)
         {
             for (UINT i = 0; i < kMaxOpenMaps; ++i)
             {
                 if (!g_openMaps[i].res)
                 {
                     target = &g_openMaps[i];
-                    ++g_openMapCount;
+                    InterlockedIncrement(&g_openMapCount);
                     break;
                 }
             }
@@ -4587,24 +5211,37 @@ static HRESULT STDMETHODCALLTYPE Hook_Map(ID3D11DeviceContext* This, ID3D11Resou
 }
 
 // --- [15] Unmap -------------------------------------------------------------------
+static __declspec(noinline) void UnmapDiag(ID3D11DeviceContext* This, TRHF_PFN_Unmap o, ID3D11Resource* pResource,
+                                           UINT Subresource);
+
 static void STDMETHODCALLTYPE Hook_Unmap(ID3D11DeviceContext* This, ID3D11Resource* pResource, UINT Subresource)
 {
     TRHF_COUNT(VT_Unmap);
     const TRHF_PFN_Unmap o = TRHF_ORIG(TRHF_PFN_Unmap, VT_Unmap);
     // v1.4.4: first, ungated - copies redirected maps back before the original Unmap
-    FixOnUnmap(pResource, Subresource);
+    FixOnUnmap(This, pResource, Subresource);
     if (t_inOverlay)
     {
         o(This, pResource, Subresource);
         return;
     }
-    if (!LoggingActive() || !pResource || Subresource != 0)
+    // Lock-free early-out (like FixOnUnmap): no tracked diagnostic map open and
+    // no capture -> UnmapDiag would only call the original + Rearm anyway.
+    if (!LoggingActive() || !pResource || Subresource != 0 || (g_openMapCount == 0 && !CaptureActive()))
     {
         o(This, pResource, Subresource);
         Rearm(This);
         return;
     }
+    UnmapDiag(This, o, pResource, Subresource);
+}
 
+// v1.4.6: diagnostics part of Hook_Unmap (logging on). Separate, non-inlined,
+// so the 4 KB copy buffer (__chkstk) is not in the hot hook's frame. Calls the
+// original Unmap and Rearm itself (same order as before).
+static __declspec(noinline) void UnmapDiag(ID3D11DeviceContext* This, TRHF_PFN_Unmap o, ID3D11Resource* pResource,
+                                           UINT Subresource)
+{
     OpenMap om = {};
     int slot = -1;
     UINT sample = 0;
@@ -4617,7 +5254,7 @@ static void STDMETHODCALLTYPE Hook_Unmap(ID3D11DeviceContext* This, ID3D11Resour
             {
                 om = g_openMaps[i];
                 g_openMaps[i] = OpenMap{};
-                --g_openMapCount;
+                InterlockedDecrement(&g_openMapCount);
                 break;
             }
         }
@@ -4762,6 +5399,11 @@ static void STDMETHODCALLTYPE Hook_RSSetScissorRects(ID3D11DeviceContext* This, 
 }
 
 // --- [48] UpdateSubresource ---------------------------------------------------------
+static __declspec(noinline) void UpdateDiag(ID3D11DeviceContext* This, TRHF_PFN_UpdateSubresource o,
+                                            ID3D11Resource* pDstResource, UINT DstSubresource, const D3D11_BOX* pDstBox,
+                                            const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch, bool cap,
+                                            bool samp);
+
 static void STDMETHODCALLTYPE Hook_UpdateSubresource(ID3D11DeviceContext* This, ID3D11Resource* pDstResource,
                                                      UINT DstSubresource, const D3D11_BOX* pDstBox, const void* pSrcData,
                                                      UINT SrcRowPitch, UINT SrcDepthPitch)
@@ -4785,7 +5427,17 @@ static void STDMETHODCALLTYPE Hook_UpdateSubresource(ID3D11DeviceContext* This, 
         Rearm(This);
         return;
     }
+    UpdateDiag(This, o, pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, cap, samp);
+}
 
+// v1.4.6: diagnostics part of Hook_UpdateSubresource (logging on). Separate,
+// non-inlined, so the 4 KB copy buffer (__chkstk) is not in the hot hook's
+// frame. Calls the original and Rearm itself (same order as before).
+static __declspec(noinline) void UpdateDiag(ID3D11DeviceContext* This, TRHF_PFN_UpdateSubresource o,
+                                            ID3D11Resource* pDstResource, UINT DstSubresource, const D3D11_BOX* pDstBox,
+                                            const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch, bool cap,
+                                            bool samp)
+{
     D3D11_BUFFER_DESC d = {};
     const void* buf = QueryBuffer(pDstResource, &d);
     const bool isCB = buf && (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0;
@@ -4959,6 +5611,8 @@ static void InstallContextHooks(ID3D11DeviceContext* ctx, const char* origin)
     t->uTriggerThisFrame = false;
     t->uTriggerPrevFrame = false;
     t->gateLogged = false;
+    for (UINT i = 0; i < VT_COUNT; ++i)
+        t->rejected[i] = nullptr; // v1.4.6
 
     // Pass 1: originals of this table (published before any entry is swapped).
     for (UINT k = 0; k < kHookCount; ++k)
@@ -5107,8 +5761,9 @@ static void PerfModeApply(IDXGISwapChain* sc, LONG mode)
         return;
     void** vtbl = *reinterpret_cast<void***>(ctx);
     const SIZE_T size = VT_COUNT * sizeof(void*);
-    UINT changed = 0;
+    UINT changed = 0, foreign = 0;
     bool found = false, ok = false;
+    const bool modeChanged = (mode != g_perfMode);
     AcquireSRWLockExclusive(&g_hookLock);
     HookedTable* t = vtbl ? FindTable(vtbl) : nullptr;
     if (t)
@@ -5142,8 +5797,16 @@ static void PerfModeApply(IDXGISwapChain* sc, LONG mode)
                 void* put = nullptr;
                 if (want && cur && cur != hd.hook)
                 {
-                    t->orig[hd.index] = cur; // runtime's current entry becomes the original
-                    put = hd.hook;
+                    // v1.4.6: adopt only a same-module entry (runtime rewrite), never a foreign hook.
+                    if (t->orig[hd.index] && ModuleOf(cur) != ModuleOf(t->orig[hd.index]))
+                    {
+                        ++foreign;
+                    }
+                    else
+                    {
+                        t->orig[hd.index] = cur; // runtime's current entry becomes the original
+                        put = hd.hook;
+                    }
                 }
                 else if (!want && cur == hd.hook && t->orig[hd.index])
                 {
@@ -5165,6 +5828,15 @@ static void PerfModeApply(IDXGISwapChain* sc, LONG mode)
     }
     ReleaseSRWLockExclusive(&g_hookLock);
     ctx->Release();
+    if (modeChanged)
+        FixMapsReset(); // v1.4.6: no open redirected map survives a hook-set change
+    if (foreign)
+    {
+        InterlockedExchangeAdd(&g_rearmForeign, static_cast<LONG>(foreign));
+        static volatile LONG s_logged = 0;
+        if (LoggingActive() && InterlockedExchange(&s_logged, 1) == 0)
+            Log("[PERF] %u context entry/entries replaced by another module - left alone", foreign);
+    }
     char label[64];
     PerfModeLabel(mode, label, sizeof(label));
     Log("[PERF] hook test mode %ld (%s): %u entries changed%s", mode, label, changed,
@@ -5527,6 +6199,8 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateInputLayout(ID3D11Device* This, cons
 {
     const TRHF_PFN_CreateInputLayout o =
         reinterpret_cast<TRHF_PFN_CreateInputLayout>(ClassOrig(g_deviceHooks, This, DV_CreateInputLayout));
+    if (!o)
+        return E_FAIL; // v1.4.6: no original known (should not happen)
     if (t_inOverlay)
         return o(This, pInputElementDescs, NumElements, pShaderBytecodeWithInputSignature, BytecodeLength, ppInputLayout);
     const HRESULT hr =
@@ -5542,6 +6216,8 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateVertexShader(ID3D11Device* This, con
 {
     const TRHF_PFN_CreateVertexShader o =
         reinterpret_cast<TRHF_PFN_CreateVertexShader>(ClassOrig(g_deviceHooks, This, DV_CreateVertexShader));
+    if (!o)
+        return E_FAIL;
     if (t_inOverlay)
         return o(This, pShaderBytecode, BytecodeLength, pClassLinkage, ppVertexShader);
     const HRESULT hr = o(This, pShaderBytecode, BytecodeLength, pClassLinkage, ppVertexShader);
@@ -5556,6 +6232,8 @@ static HRESULT STDMETHODCALLTYPE Hook_CreatePixelShader(ID3D11Device* This, cons
 {
     const TRHF_PFN_CreatePixelShader o =
         reinterpret_cast<TRHF_PFN_CreatePixelShader>(ClassOrig(g_deviceHooks, This, DV_CreatePixelShader));
+    if (!o)
+        return E_FAIL;
     if (t_inOverlay)
         return o(This, pShaderBytecode, BytecodeLength, pClassLinkage, ppPixelShader);
     const HRESULT hr = o(This, pShaderBytecode, BytecodeLength, pClassLinkage, ppPixelShader);
@@ -5671,6 +6349,10 @@ static float    g_perfMs = 0.0f;
 static float    g_perfLow1 = 0.0f;
 static float    g_perfPlot[kFtRing] = {}; // chronological copy for the menu graph
 static UINT     g_perfPlotCount = 0;
+// v1.4.6: set each Present by OverlayBeforePresent (menu, FPS overlay or
+// benchmark shown); the frame-time statistics (240-float sort) only run then.
+static bool     g_perfStatsWanted = false;
+static bool     g_perfStatsStale  = true;  // recompute at once when they become wanted
 
 static LONGLONG QpcNow()
 {
@@ -5705,10 +6387,15 @@ static void PerfOnPresent()
     }
     g_ftLastQpc = now;
     ++g_perfFramesSince;
-    if (g_ftCount == 0 || now - g_perfLastCalc < freq / 2) // recompute every 0.5 s
+    if (g_ftCount == 0)
         return;
-    g_perfLastCalc = now;
+    const bool due = now - g_perfLastCalc >= freq / 2; // recompute every 0.5 s
+    const bool want = g_perfStatsWanted;
+    if (!due && !(want && g_perfStatsStale))
+        return;
+    if (due)
     {
+        g_perfLastCalc = now;
         LONG sum[PG_COUNT] = {};
         for (UINT i = 0; i < VT_COUNT; ++i)
         {
@@ -5731,6 +6418,12 @@ static void PerfOnPresent()
         g_redirCnt = 0;
         g_perfFramesSince = 0;
     }
+    if (!want)
+    {
+        g_perfStatsStale = true;
+        return;
+    }
+    g_perfStatsStale = false;
 
     float sorted[kFtRing];
     double sum = 0.0;
@@ -5940,19 +6633,45 @@ static bool PrepareFlipDesc(const DXGI_SWAP_CHAIN_DESC* in, DXGI_SWAP_CHAIN_DESC
 static bool RealFullscreen(IDXGISwapChain* sc);
 
 
+// v1.4.6: once per session - Present reported device removed/reset: record the
+// removal reason for the crash report. Rare path only (no per-frame cost).
+static volatile LONG g_devRemovedNoted = 0;
+static __declspec(noinline) void DeviceRemovedNote(IDXGISwapChain* sc, HRESULT hr)
+{
+    if (InterlockedExchange(&g_devRemovedNoted, 1) != 0)
+        return;
+    HRESULT reason = E_FAIL;
+    ID3D11Device* dev = nullptr;
+    if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(&dev))) && dev) // AddRef'd
+    {
+        reason = dev->GetDeviceRemovedReason();
+        dev->Release();
+    }
+    EventPush("[DEVICE] device removed hr=0x%08lX reason=0x%08lX (swapchain %p)", static_cast<unsigned long>(hr),
+              static_cast<unsigned long>(reason), static_cast<void*>(sc));
+    if (LoggingActive())
+        Log("[DEVICE] Present: device removed hr=0x%08lX reason=0x%08lX (swapchain %p)", static_cast<unsigned long>(hr),
+            static_cast<unsigned long>(reason), static_cast<void*>(sc));
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* This, UINT SyncInterval, UINT Flags)
 {
     const TRHF_PFN_Present o = reinterpret_cast<TRHF_PFN_Present>(ClassOrig(g_swapHooks, This, SW_Present));
+    if (!o)
+        return DXGI_ERROR_INVALID_CALL; // v1.4.6: no original known (should not happen)
     const bool real = !(Flags & DXGI_PRESENT_TEST) && g_active && !g_shutdown;
     const bool game = real && This == g_gameSc;
     if (game)
     {
+        MemWarnPoll();              // v1.4.6: time-sliced address-space walk + low-memory check
         OverlayBeforePresent(This); // hotkeys; menu/FPS overlay only do work while shown
         LimiterWait();              // FpsLimit (0 = off)
         if (g_tearingActive && SyncInterval == 0 && !RealFullscreen(This))
             Flags |= DXGI_PRESENT_ALLOW_TEARING;
     }
     const HRESULT hr = o(This, SyncInterval, Flags);
+    if ((hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) && g_active && !g_shutdown)
+        DeviceRemovedNote(This, hr);
     if (real)
     {
         if (game)
@@ -5969,6 +6688,8 @@ static HRESULT STDMETHODCALLTYPE Hook_SetFullscreenState(IDXGISwapChain* This, B
 {
     const TRHF_PFN_SetFullscreenState o =
         reinterpret_cast<TRHF_PFN_SetFullscreenState>(ClassOrig(g_swapHooks, This, SW_SetFullscreenState));
+    if (!o)
+        return DXGI_ERROR_INVALID_CALL; // v1.4.6
     if (g_startBorderless && This == g_gameSc && g_active && !g_shutdown)
     {
         // Borderless: never enter exclusive fullscreen; fake the state instead.
@@ -6007,6 +6728,8 @@ static HRESULT STDMETHODCALLTYPE Hook_GetFullscreenState(IDXGISwapChain* This, B
         }
         return S_OK;
     }
+    if (!o)
+        return DXGI_ERROR_INVALID_CALL; // v1.4.6
     return o(This, pFullscreen, ppTarget);
 }
 
@@ -6023,6 +6746,8 @@ static HRESULT STDMETHODCALLTYPE Hook_ResizeBuffers(IDXGISwapChain* This, UINT B
 {
     const TRHF_PFN_ResizeBuffers o =
         reinterpret_cast<TRHF_PFN_ResizeBuffers>(ClassOrig(g_swapHooks, This, SW_ResizeBuffers));
+    if (!o)
+        return DXGI_ERROR_INVALID_CALL; // v1.4.6
     if (This == g_gameSc)
     {
         OverlayReleaseRTV(); // must not hold back-buffer references across ResizeBuffers
@@ -6046,6 +6771,8 @@ static HRESULT STDMETHODCALLTYPE Hook_ResizeBuffers(IDXGISwapChain* This, UINT B
 static HRESULT STDMETHODCALLTYPE Hook_ResizeTarget(IDXGISwapChain* This, const DXGI_MODE_DESC* pNewTargetParameters)
 {
     const TRHF_PFN_ResizeTarget o = reinterpret_cast<TRHF_PFN_ResizeTarget>(ClassOrig(g_swapHooks, This, SW_ResizeTarget));
+    if (!o)
+        return DXGI_ERROR_INVALID_CALL; // v1.4.6
     const HRESULT hr = o(This, pNewTargetParameters);
     if (DxgiLogAllowed())
     {
@@ -6176,6 +6903,8 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateSwapChain(IDXGIFactory* This, IUnkno
                                                       IDXGISwapChain** ppSwapChain)
 {
     const TRHF_PFN_CreateSwapChain o = reinterpret_cast<TRHF_PFN_CreateSwapChain>(ClassOrig(g_factoryHooks, This, 0));
+    if (!o)
+        return DXGI_ERROR_INVALID_CALL; // v1.4.6
     DXGI_SWAP_CHAIN_DESC flipDesc = {};
     bool tearing = false;
     const bool flip = g_active && !g_shutdown && PrepareFlipDesc(pDesc, &flipDesc, This, &tearing);
@@ -6855,6 +7584,7 @@ static void MenuSaveIni()
     ok = IniWriteInt(L"Display", L"FlipModel", g_cfg.flipModel ? 1 : 0) && ok;
     ok = IniWriteInt(L"Display", L"AllowTearing", g_cfg.allowTearing ? 1 : 0) && ok;
     ok = IniWriteKey(L"Capture", L"CaptureHotkey", g_cfg.captureHotkey) && ok;
+    ok = IniWriteInt(L"Memory", L"MemWarning", g_cfg.memWarning ? 1 : 0) && ok;
     g_ov.saveOk = ok;
     g_ov.saveErr = ok ? 0 : GetLastError();
     g_ov.saveMsgTick = GetTickCount();
@@ -6890,6 +7620,7 @@ static void MenuResetDefaults()
     g_cfg.fixToggleHotkey = 0x78; // F9
     g_cfg.overlayHotkey   = 0;    // none
     g_cfg.captureHotkey   = 0x79; // F10
+    g_cfg.memWarning      = true;
     g_ov.limitCustom = false;
     g_ov.menuClearConfirm = false;
     Log("[MENU] reset to defaults");
@@ -6992,6 +7723,41 @@ static void MenuTabPerf(float s)
         ImGui::PlotLines("##frametimes", g_perfPlot, static_cast<int>(g_perfPlotCount), 0, nullptr, 0.0f, yMax,
                          ImVec2(ImGui::GetContentRegionAvail().x, 60.0f * s));
     ImGui::TextDisabled("Frame time graph: 0..%.0f ms", static_cast<double>(yMax));
+
+    // v1.4.6 low address-space warning + address-space bar (cached values, max. 1 refresh/s)
+    ImGui::Spacing();
+    if (ImGui::Checkbox("Low memory warning", &g_cfg.memWarning))
+        Log("[MEM] low memory warning %s (menu)", g_cfg.memWarning ? "on" : "off");
+    ImGui::SetItemTooltip("Shows a notice when the game's 32-bit address space runs low,\n"
+                          "so you can save and restart before an out-of-memory crash.");
+    MemStatNoteMenu();
+    if (g_memStat.valid && g_memStat.totalMB > 0)
+    {
+        const ULONGLONG usedMB = g_memStat.totalMB > g_memStat.availMB ? g_memStat.totalMB - g_memStat.availMB : 0ull;
+        const float frac = static_cast<float>(static_cast<double>(usedMB) / static_cast<double>(g_memStat.totalMB));
+        char ov[96];
+        _snprintf_s(ov, sizeof(ov), _TRUNCATE, "%.2f / %.2f GB used - largest free block %llu MB",
+                    static_cast<double>(usedMB) / 1024.0, static_cast<double>(g_memStat.totalMB) / 1024.0,
+                    g_memStat.largestMB);
+        int pushed = 0;
+        if (MemLow())
+        {
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.80f, 0.12f, 0.10f, 1.0f)); // red
+            pushed = 1;
+        }
+        else if (g_memStat.availMB < 2ull * g_cfg.memWarnFreeMB)
+        {
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.90f, 0.75f, 0.10f, 1.0f)); // yellow
+            pushed = 1;
+        }
+        ImGui::TextUnformatted("Address space used");
+        ImGui::ProgressBar(frac, ImVec2(ImGui::GetContentRegionAvail().x, 0.0f), ov);
+        if (pushed)
+            ImGui::PopStyleColor(pushed);
+        ImGui::SetItemTooltip("32-bit game process: about 4 GB in total. Warning below %u MB free\n"
+                              "or a largest free block below %u MB ([Memory] in the ini).",
+                              g_cfg.memWarnFreeMB, g_cfg.memWarnBlockMB);
+    }
 }
 
 static void MenuTabDisplay()
@@ -7075,6 +7841,15 @@ static void MenuTabInfo()
     ImGui::Text("Salvage fixes/s: %.0f", static_cast<double>(g_ov.svRate));
     if (LoggingActive())
         ImGui::Text("Watchdog: A %ld / OFF %ld", static_cast<LONG>(g_watchATotal), static_cast<LONG>(g_watchOffTotal));
+    // v1.4.6
+    MemStatNoteMenu();
+    if (g_memStat.valid)
+        ImGui::Text("Address space: %llu MB free of %llu MB, largest block %llu MB", g_memStat.availMB,
+                    g_memStat.totalMB, g_memStat.largestMB);
+    ImGui::TextDisabled("Map safety: stale drops %ld, guard hits %ld, re-arms Map/Unmap/Upd %ld/%ld/%ld",
+                        static_cast<LONG>(g_fixStaleDrops), static_cast<LONG>(g_scratchGuardHits),
+                        static_cast<LONG>(g_rearmCount[VT_Map]), static_cast<LONG>(g_rearmCount[VT_Unmap]),
+                        static_cast<LONG>(g_rearmCount[VT_UpdateSubresource]));
     if (g_gateMenuNow)
         ImGui::Text("Context: MENU (G%c)", g_gateReasonNow ? g_gateReasonNow : '?');
     else
@@ -7305,6 +8080,29 @@ static void OverlayBuildFpsOsd()
     ImGui::PopStyleColor(2);
 }
 
+// v1.4.6 low-memory toast: top centre, no input, opaque dark red with white
+// text (readable on any background), also while the menu is closed.
+static void OverlayBuildMemToast()
+{
+    const float s = g_ov.uiScale;
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, 40.0f * s), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav |
+                                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoMove;
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.45f, 0.06f, 0.04f, 0.95f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f * s, 8.0f * s));
+    if (ImGui::Begin("##trhf_memtoast", nullptr, flags))
+        ImGui::TextUnformatted(g_memToastText);
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(3);
+}
+
 static void BenchWriteFile()
 {
     wchar_t path[1024];
@@ -7331,6 +8129,11 @@ static void BenchWriteFile()
     fprintf(f, "calls/frame (Normal): Map %.0f Unmap %.0f UpdateSubresource %.0f\r\n",
             static_cast<double>(g_benchCallsMap[0]), static_cast<double>(g_benchCallsMap[1]),
             static_cast<double>(g_benchCallsMap[2]));
+    fprintf(f, "map safety (session): stale map drops %ld, scratch guard hits %ld, re-arms Map %ld Unmap %ld "
+               "UpdateSubresource %ld, foreign entries left alone %ld\r\n",
+            static_cast<LONG>(g_fixStaleDrops), static_cast<LONG>(g_scratchGuardHits),
+            static_cast<LONG>(g_rearmCount[VT_Map]), static_cast<LONG>(g_rearmCount[VT_Unmap]),
+            static_cast<LONG>(g_rearmCount[VT_UpdateSubresource]), static_cast<LONG>(g_rearmForeign));
     for (UINT i = 0; i < g_perfTraceCount; ++i)
     {
         const PerfTrace& tr = g_perfTrace[i];
@@ -7406,11 +8209,25 @@ static void BenchStartStep(IDXGISwapChain* sc, int step)
         PerfModeApply(sc, kBenchSeq[step]);
 }
 
-static void BenchTick(IDXGISwapChain* sc, bool suppressed)
+// v1.4.6: overlay/perf hotkeys are sampled every 50 ms (not every Present).
+// Besides the "down now" bit, bit 0 ("pressed since the previous
+// GetAsyncKeyState call") counts as down, so a tap shorter than the poll
+// interval is not lost. tapBit is false for the very first sample (stale bit).
+static const DWORD kHotkeyPollMs = 50;
+static DWORD g_hotkeyPollTick = 0;
+static bool  g_hotkeyPolled   = false; // at least one sample taken
+
+static inline bool HotkeySample(UINT vk, bool tapBit)
 {
-    if (g_cfg.benchHotkey)
+    const USHORT s = static_cast<USHORT>(GetAsyncKeyState(static_cast<int>(vk)));
+    return (s & 0x8000u) != 0 || (tapBit && (s & 1u) != 0);
+}
+
+static void BenchTick(IDXGISwapChain* sc, bool suppressed, bool pollKeys, bool tapBit)
+{
+    if (g_cfg.benchHotkey && pollKeys)
     {
-        const bool down = (static_cast<USHORT>(GetAsyncKeyState(static_cast<int>(g_cfg.benchHotkey))) & 0x8000u) != 0;
+        const bool down = HotkeySample(g_cfg.benchHotkey, tapBit);
         if (down && !g_benchKeyWasDown && !suppressed)
         {
             if (g_benchStep < 0)
@@ -7458,48 +8275,74 @@ static void BenchTick(IDXGISwapChain* sc, bool suppressed)
 // Present hook on the game swap chain (before the original Present).
 static void OverlayBeforePresent(IDXGISwapChain* sc)
 {
-    const bool suppressed = HotkeysSuppressed();
-    if (g_cfg.menuHotkey)
+    const DWORD keyNow = GetTickCount();
+    const bool pollKeys = !g_hotkeyPolled || keyNow - g_hotkeyPollTick >= kHotkeyPollMs;
+    const bool tapBit = g_hotkeyPolled;
+    const bool suppressed = pollKeys && HotkeysSuppressed();
+    if (pollKeys)
     {
-        const bool down =
-            (static_cast<USHORT>(GetAsyncKeyState(static_cast<int>(g_cfg.menuHotkey))) & 0x8000u) != 0;
-        if (down && !g_ov.menuKeyWasDown && !suppressed)
-            OverlaySetOpen(g_menuOpen == 0, sc);
-        g_ov.menuKeyWasDown = down;
-    }
-    if (g_cfg.overlayHotkey)
-    {
-        const bool down =
-            (static_cast<USHORT>(GetAsyncKeyState(static_cast<int>(g_cfg.overlayHotkey))) & 0x8000u) != 0;
-        if (down && !g_ov.overlayKeyWasDown && !suppressed)
+        g_hotkeyPollTick = keyNow;
+        g_hotkeyPolled = true;
+        if (g_cfg.menuHotkey)
         {
-            g_cfg.showFpsOverlay = !g_cfg.showFpsOverlay;
-            Log("[PERF] FPS overlay %s (hotkey)", g_cfg.showFpsOverlay ? "on" : "off");
+            const bool down = HotkeySample(g_cfg.menuHotkey, tapBit);
+            if (down && !g_ov.menuKeyWasDown && !suppressed)
+                OverlaySetOpen(g_menuOpen == 0, sc);
+            g_ov.menuKeyWasDown = down;
         }
-        g_ov.overlayKeyWasDown = down;
+        if (g_cfg.overlayHotkey)
+        {
+            const bool down = HotkeySample(g_cfg.overlayHotkey, tapBit);
+            if (down && !g_ov.overlayKeyWasDown && !suppressed)
+            {
+                g_cfg.showFpsOverlay = !g_cfg.showFpsOverlay;
+                Log("[PERF] FPS overlay %s (hotkey)", g_cfg.showFpsOverlay ? "on" : "off");
+            }
+            g_ov.overlayKeyWasDown = down;
+        }
+        if (g_cfg.perfTestHotkey)
+        {
+            const bool down = HotkeySample(g_cfg.perfTestHotkey, tapBit);
+            if (down && !g_ov.perfKeyWasDown && !suppressed)
+                PerfModeApply(sc, (g_perfMode + 1) % kPerfModes);
+            g_ov.perfKeyWasDown = down;
+        }
     }
-    if (g_cfg.perfTestHotkey)
-    {
-        const bool down =
-            (static_cast<USHORT>(GetAsyncKeyState(static_cast<int>(g_cfg.perfTestHotkey))) & 0x8000u) != 0;
-        if (down && !g_ov.perfKeyWasDown && !suppressed)
-            PerfModeApply(sc, (g_perfMode + 1) % kPerfModes);
-        g_ov.perfKeyWasDown = down;
-    }
-    BenchTick(sc, suppressed);
+    BenchTick(sc, suppressed, pollKeys, tapBit);
     const bool menu = g_menuOpen != 0;
-    if (!menu && !g_cfg.showFpsOverlay && g_benchStep < 0 && !g_benchDone)
+    const bool other = menu || g_cfg.showFpsOverlay || g_benchStep >= 0 || g_benchDone;
+    g_perfStatsWanted = other; // PerfOnPresent: frame-time statistics only while displayed
+    const bool toast = MemToastActive(); // v1.4.6
+    // v1.4.6: with MemWarning on, initialise the overlay early in the session
+    // (~10 s of frames), while address space is still plentiful, so the
+    // low-memory toast can always be drawn later without loading d3dcompiler /
+    // building the font atlas at the worst possible moment. MenuHotkey=0 (no
+    // overlay wanted) keeps the old behaviour: log / event ring only.
+    if (!g_ov.initTried && g_cfg.memWarning && g_cfg.menuHotkey && g_frameCount > 600)
+        OverlayInit(sc);
+    if (!other && !toast)
         return; // nothing shown: no ImGui work at all
     if (!g_ov.initTried)
+    {
+        // v1.4.6: the low-memory toast alone never initialises ImGui (d3dcompiler,
+        // shaders, font atlas = address space) - it is only drawn if the overlay
+        // already exists; otherwise the warning stays in the log / event ring.
+        if (!other)
+            return;
         OverlayInit(sc);
+    }
     if (!g_ov.ok)
-        return;
-    if (!g_ov.rtv && !OverlayCreateRTV(sc))
         return;
 
     bool close = false;
-    t_inOverlay = true;
+    // v1.4.6: RTV check/creation inside g_imguiCs (ResizeBuffers releases it under the same lock).
     EnterCriticalSection(&g_imguiCs);
+    if (!g_ov.rtv && !OverlayCreateRTV(sc))
+    {
+        LeaveCriticalSection(&g_imguiCs);
+        return;
+    }
+    t_inOverlay = true;
     ImGuiIO& io = ImGui::GetIO();
     // Cursor only while the menu is open; the FPS overlay must not touch it.
     io.MouseDrawCursor = menu;
@@ -7519,6 +8362,8 @@ static void OverlayBeforePresent(IDXGISwapChain* sc)
         close = OverlayBuildMenu();
     if (g_cfg.showFpsOverlay || g_benchStep >= 0 || g_benchDone)
         OverlayBuildFpsOsd();
+    if (toast)
+        OverlayBuildMemToast();
     ImGui::Render();
 
     ID3D11RenderTargetView* oldRtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
@@ -7551,9 +8396,9 @@ static void HookDevice(ID3D11Device* dev, const char* origin)
 }
 
 // =============================================================================
-//  Device creation (shared by proxy and ASI mode)
+//  Device creation (called from the proxy exports)
 // =============================================================================
-static thread_local int t_createDepth = 0; // suppresses nested/internal and dummy-device calls
+static thread_local int t_createDepth = 0; // suppresses nested/internal device-creation calls
 static LONG g_firstDevice = 0;
 
 static void OnDeviceCreated(const char* api, HRESULT hr, IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE driverType,
@@ -7688,9 +8533,8 @@ static HRESULT DoCreateDeviceAndSwapChain(PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN
 }
 
 // =============================================================================
-//  PROXY MODE (d3d11.dll): chain loading + exports
+//  PROXY (d3d11.dll): chain loading + exports
 // =============================================================================
-#if defined(TRHF_PROXY)
 
 static HMODULE g_hTarget = nullptr;
 static PFN_D3D11_CREATE_DEVICE g_realCreateDevice = nullptr;
@@ -7965,199 +8809,6 @@ extern "C" HRESULT WINAPI Proxy_D3D11CreateDeviceAndSwapChain(
                                       pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
 }
 
-#endif // TRHF_PROXY
-
-// =============================================================================
-//  ASI MODE: Windows hotpatch of D3D11CreateDevice* in the loaded d3d11.dll,
-//  fallback = dummy device in a worker thread -> shared context vtable.
-// =============================================================================
-static HMODULE g_asiD3d = nullptr;
-static void* volatile g_asiOrigCreateDevice = nullptr;             // func + 2
-static void* volatile g_asiOrigCreateDeviceAndSwapChain = nullptr; // func + 2
-
-static HRESULT WINAPI AsiHook_D3D11CreateDevice(IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software,
-                                                UINT Flags, const D3D_FEATURE_LEVEL* pFeatureLevels,
-                                                UINT FeatureLevels, UINT SDKVersion, ID3D11Device** ppDevice,
-                                                D3D_FEATURE_LEVEL* pFeatureLevel,
-                                                ID3D11DeviceContext** ppImmediateContext)
-{
-    return DoCreateDevice(reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(g_asiOrigCreateDevice), "D3D11CreateDevice[asi]",
-                          pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion, ppDevice,
-                          pFeatureLevel, ppImmediateContext);
-}
-
-static HRESULT WINAPI AsiHook_D3D11CreateDeviceAndSwapChain(
-    IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags,
-    const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion,
-    const DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, IDXGISwapChain** ppSwapChain, ID3D11Device** ppDevice,
-    D3D_FEATURE_LEVEL* pFeatureLevel, ID3D11DeviceContext** ppImmediateContext)
-{
-    return DoCreateDeviceAndSwapChain(
-        reinterpret_cast<PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN>(g_asiOrigCreateDeviceAndSwapChain),
-        "D3D11CreateDeviceAndSwapChain[asi]", pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
-        SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
-}
-
-// Windows hotpatch: function starts with 8B FF (mov edi,edi) and is preceded
-// by 5 bytes of CC/90 padding. Write "E9 rel32" (jmp hook) into the padding,
-// then atomically replace 8B FF with EB F9 (jmp short -7). The original is
-// reached via func + 2. Returns false (nothing modified) if not hotpatchable.
-static bool HotpatchInstall(void* target, void* hook, void* volatile* origOut, char* why, size_t whyCap)
-{
-    unsigned char* p = static_cast<unsigned char*>(target);
-    unsigned char pre[7] = {};
-    if (!SafeCopy(pre, p - 5, sizeof(pre)))
-    {
-        _snprintf_s(why, whyCap, _TRUNCATE, "prolog not readable");
-        return false;
-    }
-    if (pre[5] == 0xEB && pre[6] == 0xF9)
-    {
-        _snprintf_s(why, whyCap, _TRUNCATE, "already hotpatched by another module");
-        return false;
-    }
-    if (pre[5] != 0x8B || pre[6] != 0xFF)
-    {
-        _snprintf_s(why, whyCap, _TRUNCATE, "no mov edi,edi prolog (bytes %02X %02X)", pre[5], pre[6]);
-        return false;
-    }
-    for (int i = 0; i < 5; ++i)
-    {
-        if (pre[i] != 0xCC && pre[i] != 0x90)
-        {
-            _snprintf_s(why, whyCap, _TRUNCATE, "no 5-byte CC/90 padding before function");
-            return false;
-        }
-    }
-
-    DWORD oldProt = 0;
-    if (!VirtualProtect(p - 5, 7, PAGE_EXECUTE_READWRITE, &oldProt))
-    {
-        _snprintf_s(why, whyCap, _TRUNCATE, "VirtualProtect failed (err %lu)", GetLastError());
-        return false;
-    }
-
-    *origOut = p + 2; // must be valid before the jump becomes reachable
-
-    const INT32 rel = static_cast<INT32>(reinterpret_cast<INT_PTR>(hook) - reinterpret_cast<INT_PTR>(p));
-    p[-5] = 0xE9;
-    memcpy(p - 4, &rel, sizeof(rel));
-    FlushInstructionCache(GetCurrentProcess(), p - 5, 5);
-
-    SHORT expected = 0, replacement = 0;
-    const unsigned char jmpShort[2] = { 0xEB, 0xF9 };
-    memcpy(&expected, pre + 5, 2);
-    memcpy(&replacement, jmpShort, 2);
-    const SHORT prev = _InterlockedCompareExchange16(reinterpret_cast<volatile SHORT*>(p), replacement, expected);
-
-    DWORD dummy = 0;
-    VirtualProtect(p - 5, 7, oldProt, &dummy);
-    FlushInstructionCache(GetCurrentProcess(), p - 5, 7);
-
-    if (prev != expected)
-    {
-        *origOut = nullptr;
-        _snprintf_s(why, whyCap, _TRUNCATE, "prolog changed concurrently");
-        return false;
-    }
-    _snprintf_s(why, whyCap, _TRUNCATE, "ok");
-    return true;
-}
-
-// Fallback: create a throw-away device on a worker thread (never inside
-// DllMain), hook its immediate-context vtable (shared per class with the
-// game's context) and release everything again.
-static DWORD WINAPI AsiFallbackWorker(LPVOID)
-{
-    t_createDepth = 1; // our own dummy device must not be treated as the game's device
-    LateInit();
-
-    PFN_D3D11_CREATE_DEVICE create =
-        g_asiD3d ? reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(GetProcAddress(g_asiD3d, "D3D11CreateDevice")) : nullptr;
-    if (!create)
-    {
-        Log("[ASI] fallback: D3D11CreateDevice not found - no hooks");
-        t_createDepth = 0;
-        return 0;
-    }
-
-    ID3D11Device* dev = nullptr;
-    ID3D11DeviceContext* ctx = nullptr;
-    D3D_FEATURE_LEVEL fl = static_cast<D3D_FEATURE_LEVEL>(0);
-    const char* driver = "HARDWARE";
-    HRESULT hr = create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx);
-    if (FAILED(hr))
-    {
-        Log("[ASI] fallback: dummy HARDWARE device failed hr=0x%08lX, trying WARP", static_cast<unsigned long>(hr));
-        driver = "WARP";
-        hr = create(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, &fl, &ctx);
-    }
-    if (SUCCEEDED(hr) && ctx)
-    {
-        Log("[ASI] fallback: dummy %s device %p FL=0x%X created", driver, static_cast<void*>(dev),
-            static_cast<unsigned>(fl));
-        InstallContextHooks(ctx, "ASI fallback dummy device");
-    }
-    else
-    {
-        Log("[ASI] fallback: dummy device creation failed hr=0x%08lX - no hooks", static_cast<unsigned long>(hr));
-    }
-    if (ctx)
-        ctx->Release();
-    if (dev)
-        dev->Release();
-    t_createDepth = 0;
-    return 0;
-}
-
-static void AsiInstall()
-{
-    if (!g_fixInfra && !g_cfg.enableLogging)
-    {
-        Log("[ASI] EnableFix=0 and EnableLogging=0 - nothing hooked");
-        return;
-    }
-
-    // Regular search order: picks up a DXVK/ReShade d3d11.dll in the game
-    // folder if present, otherwise the system DLL. Never freed.
-    g_asiD3d = LoadLibraryW(L"d3d11.dll");
-    if (!g_asiD3d)
-    {
-        Log("[ASI] LoadLibrary(d3d11.dll) failed (err %lu) - nothing hooked", GetLastError());
-        return;
-    }
-    wchar_t modPath[1024] = {};
-    char u8[4096];
-    GetModuleFileNameW(g_asiD3d, modPath, ARRAYSIZE(modPath));
-    Log("[ASI] d3d11 module %p: %s", static_cast<void*>(g_asiD3d), ToUtf8(modPath, u8, sizeof(u8)));
-
-    void* fCD = reinterpret_cast<void*>(GetProcAddress(g_asiD3d, "D3D11CreateDevice"));
-    void* fCDSC = reinterpret_cast<void*>(GetProcAddress(g_asiD3d, "D3D11CreateDeviceAndSwapChain"));
-
-    char why1[128] = "export not found";
-    char why2[128] = "export not found";
-    const bool ok1 = fCD && HotpatchInstall(fCD, reinterpret_cast<void*>(&AsiHook_D3D11CreateDevice),
-                                            &g_asiOrigCreateDevice, why1, sizeof(why1));
-    const bool ok2 = fCDSC && HotpatchInstall(fCDSC, reinterpret_cast<void*>(&AsiHook_D3D11CreateDeviceAndSwapChain),
-                                              &g_asiOrigCreateDeviceAndSwapChain, why2, sizeof(why2));
-    Log("[ASI] hotpatch D3D11CreateDevice@%p: %s", fCD, why1);
-    Log("[ASI] hotpatch D3D11CreateDeviceAndSwapChain@%p: %s", fCDSC, why2);
-
-    if (ok1 && ok2)
-    {
-        Log("[ASI] method: hotpatch (device creation is intercepted)");
-        return;
-    }
-
-    Log("[ASI] method: dummy-device vtable fallback (worker thread)%s",
-        (ok1 || ok2) ? " + partial hotpatch" : "");
-    HANDLE th = CreateThread(nullptr, 0, AsiFallbackWorker, nullptr, 0, nullptr);
-    if (th)
-        CloseHandle(th); // fire and forget - never wait inside DllMain
-    else
-        Log("[ASI] CreateThread failed (err %lu)", GetLastError());
-}
-
 // =============================================================================
 //  Log header
 // =============================================================================
@@ -8171,8 +8822,7 @@ static void WriteHeader()
     Log("==== TR2013 HUD Fix+ v%s - %s ====", kVersion, TRHF_Marker);
     Log("Build target : %s, compiled %s %s", kBuildTarget, __DATE__, __TIME__);
     Log("Module       : %s", ToUtf8(g_selfPath, u8, sizeof(u8)));
-    Log("Mode         : %s (module extension .asi: %s)", g_asiMode ? "ASI (in-memory D3D11CreateDevice hooks)" : "PROXY (d3d11.dll exports)",
-        g_extIsAsi ? "yes" : "no");
+    Log("Mode         : PROXY (d3d11.dll exports)");
 
     wchar_t exe[1024] = {};
     GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
@@ -8224,6 +8874,8 @@ static void WriteHeader()
         g_cfg.overlayHotkey);
     Log("  [Display] Borderless=%d FlipModel=%d AllowTearing=%d (applied at start)", g_cfg.borderless ? 1 : 0,
         g_cfg.flipModel ? 1 : 0, g_cfg.allowTearing ? 1 : 0);
+    Log("  [Memory] MemWarning=%d MemWarnFreeMB=%u MemWarnBlockMB=%u", g_cfg.memWarning ? 1 : 0, g_cfg.memWarnFreeMB,
+        g_cfg.memWarnBlockMB);
     {
         LineBuf hl;
         for (UINT i = 0; i < g_cfg.hudVsCount; ++i)
@@ -8248,7 +8900,8 @@ static void WriteHeader()
         "(row- and column-vector convention), [WINDOW] window/monitor/fullscreen state at capture start");
     Log("Legend       : [WATCH] A = anchor at the stage origin, OFF = HUD/prompt element >= 50 %% off-screen in "
         "2 consecutive sample frames (box in pixels, matrix as drawn); [MEM] private/working set, address space "
-        "(vsize = committed+reserved), largest free region, ours = our C++ heap (excl. ImGui)");
+        "(vsize = committed+reserved), largest free region, ours = our C++ heap (excl. ImGui), walk/regions = "
+        "time (sum of the per-frame slices) and region count of the last address-space walk");
     Log("Legend       : [INV] HUD inventory: each new element once; gameplay draws only (menu gate off), "
         "layer H=HUD P=prompt (within HudLayerTol/PromptLayerTol), max. 3 entries per VS/PS/layer/cnt, "
         "w = layer w (c3.w, 0.1), gate = menu gate state at the draw (always game), bb = last known back buffer "
@@ -8258,8 +8911,7 @@ static void WriteHeader()
 }
 
 // =============================================================================
-//  DllMain - kept slim: paths, ini, (logging on) log + crash handler,
-//  (ASI) hook install
+//  DllMain - kept slim: paths, ini, (logging on) log, crash handler (always)
 // =============================================================================
 extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
@@ -8279,7 +8931,6 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvRe
                            reinterpret_cast<LPCWSTR>(&DllMain), &pinned);
 
         InitPaths();
-        DetectMode();
         ReadIni();
         AcquireInstance();
         g_fixInfra = g_cfg.enableFix != 0 || g_cfg.menuHotkey != 0 || g_cfg.enableLogging != 0; // watchdog needs shadows
@@ -8290,17 +8941,16 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvRe
         {
             // [MEM] "ours" counter: enabled before our first allocation (InitState).
             g_heapCount = g_cfg.enableLogging != 0 && g_cfg.memLogSec != 0;
+            ScratchGuardInit(); // v1.4.6: scratch guard pattern (16 x 64 bytes)
             InitState();
             if (g_cfg.enableLogging)
                 OpenLog();
             WriteHeader();
+            // v1.4.6: always installed (log-only, never handles anything). Without a
+            // log file it writes tr_hud_fix_crash.txt only if a qualifying exception occurs.
+            const PVOID veh = AddVectoredExceptionHandler(0, CrashVeh);
             if (g_logOn)
-            {
-                const PVOID veh = AddVectoredExceptionHandler(0, CrashVeh); // logs only, never handles
                 Log("[DIAG] crash diagnostics %s (log rotated to tr_hud_fix.prev.log)", veh ? "installed" : "FAILED");
-            }
-            if (g_asiMode)
-                AsiInstall();
         }
         // Inactive instance (another TR_HUD_Fix already loaded): the proxy
         // still forwards all exports, but installs no hooks and writes no log.

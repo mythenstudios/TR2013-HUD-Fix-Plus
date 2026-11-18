@@ -57,6 +57,14 @@ python generate.py compare before.jpg after.jpg "Caption" tr2013-hudfix_compare_
 ```
 
 Creates `graphics/tr2013-hudfix_compare_<name>.svg` (screenshots embedded) → render to 1920×1080 PNG as above.
+Single screenshot (showcase, fix active):
+
+```bash
+python generate.py showcase shot.jpg "Caption" tr2013-hudfix_showcase_<name>
+```
+
+Template: `graphics/tr2013-hudfix_showcase_TEMPLATE.png`. Pass a plain `&` in captions (it is escaped automatically).
+
 Only use pairs that show **released** improvements. No screenshots containing the official game logo (e.g. the pause menu with the fix off).
 
 ## Design / technical

@@ -1,5 +1,5 @@
 ===============================================================================
- TR2013 HUD Fix+ 1.4.5 - Tomb Raider (2013) / GOTY - HUD position fix
+ TR2013 HUD Fix+ 1.4.6 - Tomb Raider (2013) / GOTY - HUD position fix
  Unofficial community fix. Not affiliated with Crystal Dynamics or Square Enix.
 ===============================================================================
 
@@ -65,7 +65,8 @@ In-game controls:
     FIX          Enable fix, Backdrop (Off/Move/Hide), Fix prompt position,
                  Fix popup in top-left, Salvage counter top-right
                  (with ShowAdvanced=1 in the ini also: POPUP Offset X/Y, Scale)
-    PERFORMANCE  FPS limit, FPS overlay, frame time statistics and graph
+    PERFORMANCE  FPS limit, FPS overlay, frame time statistics and graph,
+                 address space bar and low-memory warning on/off
     DISPLAY      Borderless, Flip model, Allow tearing (need a game restart)
     HOTKEYS      change keys (Change / Clear)
     INFO         version, resolution, statistics
@@ -135,6 +136,16 @@ Troubleshooting:
     (a known engine issue of the game since 2014, not caused by this fix).
   - EnableLogging=2 also writes a list of the HUD elements seen ([INV] lines)
     - this helps a lot with reports about misplaced HUD elements.
+  - Crash report: if the game crashes, the fix writes tr_hud_fix_crash.txt
+    to the game folder (also with logging off; with logging on the report
+    goes into tr_hud_fix.log). Please attach it to crash reports.
+  - Low-memory warning: the game is a 32-bit program (max. about 4 GB of
+    address space). When it runs low, a notice appears at the top of the
+    screen - save and restart the game. Settings in [Memory] in
+    tr_hud_fix.ini (MemWarning=0 turns it off).
+  - The game also crashes now and then without this fix (known since 2013).
+    Most common remedy: turn off Tessellation; if needed also TressFX or
+    reduce SSAA.
 
 Credits / licences:
   TR2013 HUD Fix+ - MIT licence (licenses\TR_HUD_Fix_LICENSE.txt)
@@ -212,7 +223,8 @@ Tasten im Spiel:
     FIX          Enable fix, Backdrop (Off/Move/Hide), Fix prompt position,
                  Fix popup in top-left, Salvage counter top-right
                  (mit ShowAdvanced=1 in der ini auch: POPUP Offset X/Y, Scale)
-    PERFORMANCE  FPS-Begrenzung, FPS-Anzeige, Frametime-Statistik und Graph
+    PERFORMANCE  FPS-Begrenzung, FPS-Anzeige, Frametime-Statistik und Graph,
+                 Adressraum-Balken und Speicher-Warnung an/aus
     DISPLAY      Randlos, Flip-Modell, Tearing (erst nach Spiel-Neustart)
     HOTKEYS      Tasten aendern (Change / Clear)
     INFO         Version, Aufloesung, Statistik
@@ -288,6 +300,17 @@ Problembehebung:
     Spiels seit 2014, nicht durch diesen Fix verursacht).
   - EnableLogging=2 schreibt ausserdem eine Liste der gesehenen HUD-Elemente
     ([INV]-Zeilen) - das hilft sehr bei Berichten zu verschobenen HUD-Elementen.
+  - Absturzbericht: Stuerzt das Spiel ab, schreibt der Fix
+    tr_hud_fix_crash.txt in den Spielordner (auch bei ausgeschaltetem
+    Logging; mit Logging landet der Bericht in tr_hud_fix.log). Bitte bei
+    Absturzmeldungen mitschicken.
+  - Speicher-Warnung: Das Spiel ist ein 32-Bit-Programm (max. ca. 4 GB
+    Adressraum). Wird er knapp, erscheint oben ein Hinweis - speichern und
+    das Spiel neu starten. Einstellungen unter [Memory] in tr_hud_fix.ini
+    (MemWarning=0 schaltet sie ab).
+  - Das Spiel stuerzt auch ohne diesen Fix gelegentlich ab (bekannt seit
+    2013). Haeufigste Abhilfe: Tessellation ausschalten, ggf. auch TressFX
+    oder SSAA reduzieren.
 
 Credits / Lizenzen:
   TR2013 HUD Fix+ - MIT-Lizenz (licenses\TR_HUD_Fix_LICENSE.txt)
