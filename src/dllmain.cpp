@@ -297,8 +297,13 @@ struct Config
     int      menuHoldFrames     = 2;         // keep the menu state N frames after the last signal
     // Popup group left at the stage origin (top-left), v1.1.3
     bool     fixPopupOrigin     = true;
-    float    popupOriginShiftX  = 1.7238f;   // moves the group to its original bottom-right place
+    float    popupOriginShiftX  = 1.7238f;   // legacy only (absolute shift, user-edited old ini)
     float    popupOriginShiftY  = -1.7258f;
+    // v1.4.6: origin group -> buggy bottom-right (U) frame, then the same popup
+    // transform as R_POPUP, so both paths land on the identical position.
+    float    popupOriginToPopupX = 2.2293f;
+    float    popupOriginToPopupY = -1.7257f;
+    bool     popupOriginLegacy   = false;
     uint64_t popupOriginPsHash  = 0x300305651E200543ull; // popup background quads (trigger)
     // Salvage counter group left at the top left (v1.3.1): back to the pre-2021 top-right place
     bool     fixSalvage         = true;
@@ -1015,6 +1020,13 @@ static void ReadIni()
     g_cfg.fixPopupOrigin   = GetPrivateProfileIntW(L"Fix", L"FixPopupOrigin", 1, g_iniPath) != 0;
     g_cfg.popupOriginShiftX = Min(Max(ReadIniFloat(L"Fix", L"PopupOriginShiftNdcX", 1.7238f), -3.0f), 3.0f);
     g_cfg.popupOriginShiftY = Min(Max(ReadIniFloat(L"Fix", L"PopupOriginShiftNdcY", -1.7258f), -3.0f), 3.0f);
+    g_cfg.popupOriginToPopupX = Min(Max(ReadIniFloat(L"Fix", L"PopupOriginToPopupNdcX", 2.2293f), -3.0f), 3.0f);
+    g_cfg.popupOriginToPopupY = Min(Max(ReadIniFloat(L"Fix", L"PopupOriginToPopupNdcY", -1.7257f), -3.0f), 3.0f);
+    // v1.4.6: old inis carry PopupOriginShiftNdcX/Y = 1.7238/-1.7258 (the old
+    // default) -> new linked mode. Only a user-edited value keeps the old
+    // absolute behaviour.
+    g_cfg.popupOriginLegacy = fabsf(g_cfg.popupOriginShiftX - 1.7238f) > 1e-3f ||
+                              fabsf(g_cfg.popupOriginShiftY - (-1.7258f)) > 1e-3f;
     GetPrivateProfileStringW(L"Fix", L"PopupOriginTriggerPsHash", L"300305651E200543", psh, ARRAYSIZE(psh), g_iniPath);
     TrimW(psh);
     {
@@ -3848,10 +3860,24 @@ static int FixBeforeDraw(ID3D11DeviceContext* This, ID3D11Buffer** prev, UINT in
         ApplyPopupXform(c + 16, p); // c4..c7 (copy)
         break;
     case R_ORIGIN:
-        c[12] += g_cfg.popupOriginShiftX * w;     // final position, no popup shift afterwards
-        c[13] += g_cfg.popupOriginShiftY * w;
-        c[28] += g_cfg.popupOriginShiftX * c[31];
-        c[29] += g_cfg.popupOriginShiftY * c[31];
+        if (g_cfg.popupOriginLegacy)
+        {
+            c[12] += g_cfg.popupOriginShiftX * w; // legacy: absolute final position
+            c[13] += g_cfg.popupOriginShiftY * w;
+            c[28] += g_cfg.popupOriginShiftX * c[31];
+            c[29] += g_cfg.popupOriginShiftY * c[31];
+        }
+        else
+        {
+            // v1.4.6: first into the buggy bottom-right frame of the U path,
+            // then exactly the R_POPUP transform -> identical position.
+            c[12] += g_cfg.popupOriginToPopupX * w;
+            c[13] += g_cfg.popupOriginToPopupY * w;
+            c[28] += g_cfg.popupOriginToPopupX * c[31];
+            c[29] += g_cfg.popupOriginToPopupY * c[31];
+            ApplyPopupXform(c, p);
+            ApplyPopupXform(c + 16, p);
+        }
         break;
     case R_SALVAGE:
         c[12] += g_cfg.salvageShiftX * w;     // c3.x
@@ -3913,7 +3939,8 @@ static int FixBeforeDraw(ID3D11DeviceContext* This, ID3D11Buffer** prev, UINT in
         if (diag && InterlockedExchange(&g_poLogged, 1) == 0)
             Log("[FIX] popup-origin moved (vsh=%016llX psh=%016llX anchor=(%.4f,%.4f) -> (%.4f,%.4f))", t->vsHash,
                 t->psHash, static_cast<double>(ax), static_cast<double>(ay),
-                static_cast<double>(ax + g_cfg.popupOriginShiftX), static_cast<double>(ay + g_cfg.popupOriginShiftY));
+                static_cast<double>(ax + (g_cfg.popupOriginLegacy ? g_cfg.popupOriginShiftX : g_cfg.popupOriginToPopupX)),
+                static_cast<double>(ay + (g_cfg.popupOriginLegacy ? g_cfg.popupOriginShiftY : g_cfg.popupOriginToPopupY)));
         break;
     case R_SALVAGE:
         InterlockedIncrement(&g_salvageTotal);
@@ -8867,9 +8894,10 @@ static void WriteHeader()
         g_cfg.captureHotkey, g_cfg.captureHotkey ? "" : " (off)", g_cfg.captureFrames, g_cfg.captureSeconds,
         g_cfg.captureMaxCBBytes, g_cfg.captureMaxLines);
     Log("  CaptureMaxVBBytes=%u", g_cfg.captureMaxVBBytes);
-    Log("  [Fix] FixPopupOrigin=%d PopupOriginShift=(%.4f,%.4f) PopupOriginTriggerPsHash=%016llX",
-        g_cfg.fixPopupOrigin ? 1 : 0, static_cast<double>(g_cfg.popupOriginShiftX),
-        static_cast<double>(g_cfg.popupOriginShiftY), g_cfg.popupOriginPsHash);
+    Log("  [Fix] FixPopupOrigin=%d PopupOriginToPopup=(%.4f,%.4f)%s PopupOriginTriggerPsHash=%016llX",
+        g_cfg.fixPopupOrigin ? 1 : 0, static_cast<double>(g_cfg.popupOriginToPopupX),
+        static_cast<double>(g_cfg.popupOriginToPopupY),
+        g_cfg.popupOriginLegacy ? " [CFG] legacy PopupOriginShift in use" : "", g_cfg.popupOriginPsHash);
     Log("  [Fix] FixSalvage=%d SalvageShift=(%.4f,%.4f)", g_cfg.fixSalvage ? 1 : 0,
         static_cast<double>(g_cfg.salvageShiftX), static_cast<double>(g_cfg.salvageShiftY));
     Log("  [Fix] HudLayerTol=%.2f PromptLayerTol=%.2f MenuMinSceneDraws=%u MenuLargeScale=%.6f MenuHoldFrames=%d "
