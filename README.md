@@ -54,6 +54,8 @@ Fixes are applied during gameplay only; menus are never modified.
    - Epic: Library > ... > Manage > Installation folder.
 3. Copy `d3d11.dll` and `tr_hud_fix.ini` into that folder and start the game.
 
+That's it: **the fix is active right away, all corrections are on by default.** No setup is needed; the settings menu (**INSERT**) is optional, and **F9** turns the fix off and on for comparison.
+
 To use it together with DXVK, ReShade or another `d3d11.dll`, rename the existing file to `d3d11_orig.dll` (or `dxvk_d3d11.dll` for DXVK) before copying, or set `ProxyDll=<file name>` in `tr_hud_fix.ini`. The fix then loads it automatically (chain loading).
 
 ### Linux / Steam Deck (Proton)

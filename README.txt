@@ -45,6 +45,8 @@ Install:
      Epic:  Library > ... > Manage > Installation folder (open folder).
   2. Copy d3d11.dll and tr_hud_fix.ini into that folder.
   3. Start the game.
+  That's it: the fix is active right away, all corrections are on by
+  default. No setup is needed; the menu (INSERT) is optional.
 
 Linux / Steam Deck (Proton) - not tested yet, feedback welcome:
   1. Copy d3d11.dll and tr_hud_fix.ini into the game folder as above.
@@ -203,6 +205,8 @@ Installation:
      Epic:  Bibliothek > ... > Verwalten > Installationsordner oeffnen.
   2. d3d11.dll und tr_hud_fix.ini in diesen Ordner kopieren.
   3. Spiel starten.
+  Fertig: Der Fix ist sofort aktiv, alle Korrekturen sind standardmaessig
+  an. Keine Einstellung noetig; das Menue (EINFG) ist optional.
 
 Linux / Steam Deck (Proton) - noch nicht getestet, Rueckmeldungen willkommen:
   1. d3d11.dll und tr_hud_fix.ini wie oben in den Spielordner kopieren.
