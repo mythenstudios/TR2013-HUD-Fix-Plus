@@ -36,6 +36,17 @@
 //      address-space walk from the Present hook (max. 64 VirtualQuery calls
 //      per frame, a new pass every 10 s), an ImGui toast when the 32-bit
 //      address space runs low (only if the overlay is already initialised).
+//    * v1.4.7-test3: [G2] notes time-throttled (1 / 2 s, max. 300).
+//    * v1.4.7-test2: [G2] notes only with a 3D scene, 100-unit buckets; G2
+//      watchdog is a repeated note (main menu also counts).
+//    * v1.4.7-test1 (diagnostic test build): probe swapchains (<= 64x64, e.g.
+//      a 2x2 capability check by an overlay) are passed through untouched -
+//      no hooks, not used as game swapchain, no fix CB. Caller module of every
+//      device/swapchain creation is recorded (log + crash event ring). Draw
+//      path no longer calls a foreign entry Rearm left alone (recursion).
+//      Diagnostics: ClassOrig fallbacks, [G2] foreign-layer notes, G2 gameplay
+//      watchdog, [STAT] 10 s counters, crash report with code bytes, stack
+//      scan and module versions.
 //
 //  Multiplayer rule: this code NEVER touches code or data of TombRaider.exe,
 //  steam_api.dll or EOSSDK-Win32-Shipping.dll (no IAT hooks in the game EXE).
@@ -69,6 +80,7 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 
+#include <intrin.h>   // v1.4.7: _ReturnAddress (caller module of device/swapchain creation)
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -85,6 +97,7 @@
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma intrinsic(_ReturnAddress) // v1.4.7
 
 // -----------------------------------------------------------------------------
 //  Marker string. build.bat uses `findstr /m /c:"TR_HUD_Fix_Marker_v1"` to
@@ -94,7 +107,7 @@
 extern "C" const char TRHF_Marker[] = "TR_HUD_Fix_Marker_v1";
 #pragma comment(linker, "/INCLUDE:_TRHF_Marker")
 
-static const char* const kVersion = "1.4.6";
+static const char* const kVersion = "1.4.7-beta1"; // v1.4.7: public test build (internal test3)
 
 static const char* const kBuildTarget = "PROXY (d3d11.dll)";
 
@@ -377,6 +390,10 @@ static volatile LONG g_crashLogged = 0;
 static volatile LONG g_crashBusy   = 0;                     // one report at a time
 static HANDLE        g_crashFile   = INVALID_HANDLE_VALUE;  // tr_hud_fix_crash.txt (logging off only)
 static HANDLE        g_crashOut    = INVALID_HANDLE_VALUE;  // target of the current report
+// v1.4.7: declared here (was in the proxy section) so the crash report can name the real d3d11.dll.
+static HMODULE       g_hTarget     = nullptr;
+// v1.4.7: ClassOrig calls through a vtable we never recorded (diagnostics, crash report, [STAT]).
+static volatile LONG g_classOrigFallbacks = 0;
 
 // One line straight into a file WITHOUT g_logCs: on a crash or at process
 // exit the lock may be owned by a crashed or already terminated thread.
@@ -530,6 +547,161 @@ static const char* CrashModName(const void* p, HMODULE* outMod)
     return b ? b + 1 : path;
 }
 
+// v1.4.7: "module+0xOFF" of a code address (caller of device/swapchain
+// creation, hooked originals). "?" outside any module, "-" for null. Not for
+// the crash handler or hot paths (GetModuleHandleEx takes the loader lock).
+static void FormatCaller(void* ret, char* out, size_t n)
+{
+    if (!out || n == 0)
+        return;
+    if (!ret)
+    {
+        strncpy_s(out, n, "-", _TRUNCATE);
+        return;
+    }
+    HMODULE m = nullptr;
+    char path[MAX_PATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(ret), &m) ||
+        !m || !GetModuleFileNameA(m, path, MAX_PATH))
+    {
+        _snprintf_s(out, n, _TRUNCATE, "?(%p)", ret);
+        return;
+    }
+    const char* b = strrchr(path, '\\');
+    _snprintf_s(out, n, _TRUNCATE, "%s+0x%IX%s", b ? b + 1 : path,
+                reinterpret_cast<UINT_PTR>(ret) - reinterpret_cast<UINT_PTR>(m), m == g_hSelf ? " (TR_HUD_Fix)" : "");
+}
+
+// v1.4.7: crash report - 16 bytes at an address as hex (static buffers).
+static void CrashHexLine(const char* what, UINT_PTR addr)
+{
+    static unsigned char bytes[16];
+    static char hex[16 * 3 + 1];
+    SIZE_T got = 0;
+    if (!addr || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(addr), bytes, sizeof(bytes), &got) ||
+        got != sizeof(bytes))
+    {
+        CrashLine("[CRASH] bytes at %s (%08IX): unreadable", what, addr);
+        return;
+    }
+    static const char kHex[] = "0123456789ABCDEF";
+    for (UINT i = 0; i < 16; ++i)
+    {
+        hex[i * 3 + 0] = kHex[bytes[i] >> 4];
+        hex[i * 3 + 1] = kHex[bytes[i] & 15];
+        hex[i * 3 + 2] = ' ';
+    }
+    hex[16 * 3 - 1] = 0;
+    CrashLine("[CRASH] bytes at %s (%08IX): %s", what, addr, hex);
+}
+
+// v1.4.7: crash report - module base / SizeOfImage / TimeDateStamp / path
+// (PE header of the mapped image, static buffers).
+static void CrashModuleLine(HMODULE m, const char* label)
+{
+    if (!m)
+        return;
+    static char path[MAX_PATH];
+    if (!GetModuleFileNameA(m, path, MAX_PATH))
+        path[0] = 0;
+    static IMAGE_DOS_HEADER dos;
+    static IMAGE_NT_HEADERS nt;
+    DWORD size = 0, stamp = 0;
+    const unsigned char* base = reinterpret_cast<const unsigned char*>(m);
+    // ReadProcessMemory instead of SafeCopy: a fault inside the handler would
+    // re-enter CrashVeh and use up one of the 3 report slots.
+    SIZE_T got1 = 0, got2 = 0;
+    if (ReadProcessMemory(GetCurrentProcess(), base, &dos, sizeof(dos), &got1) && got1 == sizeof(dos) &&
+        dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 &&
+        ReadProcessMemory(GetCurrentProcess(), base + dos.e_lfanew, &nt, sizeof(nt), &got2) && got2 == sizeof(nt) &&
+        nt.Signature == IMAGE_NT_SIGNATURE)
+    {
+        size = nt.OptionalHeader.SizeOfImage;
+        stamp = nt.FileHeader.TimeDateStamp;
+    }
+    CrashLine("[CRASH] module %s base=%p size=0x%lX timestamp=%08lX path=%s", label, static_cast<void*>(m), size, stamp,
+              path);
+}
+
+// v1.4.7: crash report - code bytes, stack scan, module versions, counters.
+// Static buffers only, no heap, no locks.
+static void CrashReportDiag(const CONTEXT* c)
+{
+    if (c)
+    {
+        CrashHexLine("eip", static_cast<UINT_PTR>(c->Eip));
+        CrashHexLine("[ecx]", static_cast<UINT_PTR>(c->Ecx));
+
+        // Stack scan: values on the stack that point into a module.
+        static DWORD stack[96];
+        UINT have = 0;
+        SIZE_T got = 0;
+        const UINT_PTR esp = static_cast<UINT_PTR>(c->Esp);
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(esp), stack, sizeof(stack), &got) &&
+            got == sizeof(stack))
+        {
+            have = 96;
+        }
+        else
+        {
+            // Near the stack base: read dword by dword up to the first unreadable one.
+            for (have = 0; have < 96; ++have)
+            {
+                got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(esp + have * 4u), &stack[have],
+                                       sizeof(DWORD), &got) ||
+                    got != sizeof(DWORD))
+                    break;
+            }
+        }
+        UINT hits = 0;
+        for (UINT i = 0; i < have && hits < 24; ++i)
+        {
+            const DWORD v = stack[i];
+            if (v < 0x10000u)
+                continue;
+            HMODULE rm = nullptr;
+            const char* rn = CrashModName(reinterpret_cast<const void*>(static_cast<UINT_PTR>(v)), &rm);
+            if (!rm)
+                continue;
+            CrashLine("[CRASH] stack [esp+0x%03X] %08lX -> %s+0x%IX%s", i * 4u, v, rn,
+                      static_cast<UINT_PTR>(v) - reinterpret_cast<UINT_PTR>(rm), rm == g_hSelf ? " (TR_HUD_Fix)" : "");
+            ++hits;
+        }
+        CrashLine("[CRASH] stack scan: %u dwords read, %u module hits", have, hits);
+    }
+
+    static const wchar_t* const kMods[] = { L"d3d11.dll",
+                                            L"dxgi.dll",
+                                            L"gameoverlayrenderer.dll",
+                                            L"EOSOVH-Win32-Shipping.dll",
+                                            L"RTSSHooks.dll",
+                                            L"DiscordHook.dll",
+                                            L"nvspcap.dll",
+                                            L"dinput8.dll",
+                                            L"version.dll",
+                                            L"ReShade32.dll" };
+    static const char* const kModNames[] = { "d3d11.dll",       "dxgi.dll",
+                                             "gameoverlayrenderer.dll", "EOSOVH-Win32-Shipping.dll",
+                                             "RTSSHooks.dll",   "DiscordHook.dll",
+                                             "nvspcap.dll",     "dinput8.dll",
+                                             "version.dll",     "ReShade32.dll" };
+    for (size_t i = 0; i < ARRAYSIZE(kMods); ++i)
+    {
+        const HMODULE m = GetModuleHandleW(kMods[i]);
+        if (m)
+            CrashModuleLine(m, kModNames[i]);
+        // d3d11.dll above normally resolves to the proxy (ourselves): also the real target, and
+        // ourselves in case the name resolved to the real one.
+        if (i == 0 && g_hTarget && g_hTarget != m)
+            CrashModuleLine(g_hTarget, "d3d11.dll(real target)");
+        if (i == 0 && g_hSelf && g_hSelf != m)
+            CrashModuleLine(g_hSelf, "TR_HUD_Fix(self)");
+    }
+    CrashLine("[CRASH] ClassOrig fallbacks %ld", static_cast<LONG>(g_classOrigFallbacks));
+}
+
 static void CrashReportExtra(); // counters + memory, defined after the fix section
 
 static const char* const kWatchedDlls[] = { "d3d11.dll", "dxgi.dll" };
@@ -638,6 +810,7 @@ static LONG CALLBACK CrashVeh(PEXCEPTION_POINTERS ep)
             CrashLine("[CRASH] null/unmapped eip: [esp] not readable");
         }
     }
+    CrashReportDiag(c); // v1.4.7: code bytes, stack scan, module versions, ClassOrig fallbacks
     CrashReportExtra();
     CrashLine("[CRASH] last DXGI/DISPLAY/DEVICE events (oldest first):");
     for (UINT i = 0; i < kEventRing; ++i)
@@ -1642,6 +1815,7 @@ static LONG  g_callCntSnap[VT_COUNT] = {};
 static float g_callPerFrameMap[3] = {}; // Map, Unmap, UpdateSubresource
 // Hit path of the CB shadow: Map/Update of a HUD-set 192-byte CB, shadow copies.
 static LONG  g_mapHitCnt = 0, g_shadowCnt = 0;
+static LONG  g_mapHitTotal = 0, g_shadowTotal = 0; // v1.4.7: session totals for [STAT] (never reset)
 static float g_mapHitPerFrame = 0.0f, g_shadowPerFrame = 0.0f, g_redirPerFrame = 0.0f;
 #define TRHF_COUNT(idx) (++g_callCnt[idx])
 // True while our ImGui overlay initialises/renders on this thread: every hook
@@ -3094,6 +3268,7 @@ static FixShadow* FixShadowSlotLocked(const void* buf)
 static void FixShadowStore(const void* buf, const void* src)
 {
     ++g_shadowCnt;
+    ++g_shadowTotal; // v1.4.7
     AcquireSRWLockExclusive(&g_fixLock);
     FixShadow* s = FixShadowSlotLocked(buf);
     s->valid = SafeCopy(s->c, src, kFixCBBytes);
@@ -3225,6 +3400,7 @@ static void FixOnMap(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT sub, D3
     if (!IsFixCB(res, &buf))
         return;
     ++g_mapHitCnt;
+    ++g_mapHitTotal; // v1.4.7
     const LONG frame = g_frameCount;
     LONG stale = 0;
     AcquireSRWLockExclusive(&g_fixLock);
@@ -3566,6 +3742,35 @@ static bool          g_gateMenuNow = false;  // last finished frame (menu INFO)
 static char          g_gateReasonNow = 0;
 static DWORD         g_gateLogTick = 0;
 static LONG          g_gateLogSuppressed = 0;
+// v1.4.7: frames with a 3D scene gated as menu by G2 (logging only) + [WATCH] once flag
+static LONG          g_g2SceneFrames = 0;
+// v1.4.7-test3: [G2] foreign-layer notes, time-throttled (1 line / 2 s, max.
+// 300 per session). test1/test2 de-duplicated by w and used up all slots in
+// the animated main menu (w drifts continuously) before gameplay started.
+static volatile LONG g_g2LastTick = 0;
+static volatile LONG g_g2Lines = 0;
+static const LONG    kG2MaxLines = 300;
+
+// v1.4.7: logs the foreign Scaleform layer that triggers G2 (diagnostics,
+// logging on only; called from FixBeforeDraw). Only frames with a 3D scene.
+static __declspec(noinline) void G2Note(HookedTable* t, float w, float ax, float ay, float maxScale)
+{
+    if (t->drawsBefore < g_cfg.menuMinSceneDraws)
+        return;
+    if (g_g2Lines >= kG2MaxLines)
+        return;
+    const LONG now = static_cast<LONG>(GetTickCount() | 1u);
+    const LONG last = g_g2LastTick;
+    if (last && static_cast<DWORD>(now - last) < 2000u)
+        return;
+    if (InterlockedCompareExchange(&g_g2LastTick, now, last) != last)
+        return;
+    const LONG n = InterlockedIncrement(&g_g2Lines);
+    Log("[G2] foreign layer w=%.1f vs=%016llX ps=%016llX anchor=(%.3f,%.3f) scale=%.6f drawsBefore=%ld frame=%ld%s",
+        static_cast<double>(w), t->vsHash, t->psHash, static_cast<double>(ax), static_cast<double>(ay),
+        static_cast<double>(maxScale), static_cast<LONG>(t->drawsBefore), static_cast<LONG>(t->gateFrame),
+        n >= kG2MaxLines ? " (limit reached, no further [G2] lines)" : "");
+}
 
 static void GateSetMenu(HookedTable* t, char reason)
 {
@@ -3596,6 +3801,19 @@ static void GateFinishFrame(HookedTable* t)
     // Diagnostics only from here on.
     if (!LoggingActive())
         return;
+    // v1.4.7: gameplay (3D scene) frames gated by G2 - the existing [WATCH]
+    // below only counts frames that passed the gate and cannot fire then.
+    if (menuFinal && reason == '2' && t->drawsBefore >= g_cfg.menuMinSceneDraws)
+    {
+        const LONG g2 = ++g_g2SceneFrames;
+        // v1.4.7-test2: the main menu (3D background) also counts here, so this
+        // is a note, repeated at 600 / 3000 / 15000 frames while no HUD-layer
+        // draw has passed the gate (no once flag).
+        if ((g2 == 600 || g2 == 3000 || g2 == 15000) && !g_hudSeenGameplay)
+            Log("[WATCH] %ld frames with a 3D scene gated as menu by G2 and no HUD-layer draw passed the gate yet "
+                "(normal in the main menu; during gameplay HudLayerW may not match this system, see [G2] lines)",
+                g2);
+    }
     if (!menuFinal && t->seenHud)
     {
         const LONG gf = InterlockedIncrement(&g_gameplayFrames);
@@ -3705,7 +3923,11 @@ static int FixBeforeDraw(ID3D11DeviceContext* This, ID3D11Buffer** prev, UINT in
             GateSetMenu(t, '1'); // G1: hardly any 3D scene before the first HUD draw
     }
     if (w > 1000.0f && !onHud && !onPrompt)
+    {
         GateSetMenu(t, '2'); // G2: foreign Scaleform layer
+        if (diag)
+            G2Note(t, w, ax, ay, maxScale); // v1.4.7: [G2] diagnostics (logging on only)
+    }
     if (t->vsHash != kVsText && w > 1000.0f && maxScale >= g_cfg.menuLargeScale)
         GateSetMenu(t, '3'); // G3: full-screen-size image element
     const bool gatedNow = t->menuThis || t->menuHold > 0;
@@ -4564,7 +4786,16 @@ static void* DrawFn(ID3D11DeviceContext* This, UINT idx, bool fixed)
     Rearm(This);
     void** vtbl = *reinterpret_cast<void***>(This);
     void* cur = vtbl[idx];
-    return (cur && cur != g_hookByIdx[idx]) ? cur : OrigFor(This, idx);
+    // v1.4.7: never call a foreign entry Rearm deliberately left alone
+    // (t->rejected, per vtable index like idx) - it may chain back into our
+    // hook and recurse. Only a runtime-installed entry is called directly.
+    if (cur && cur != g_hookByIdx[idx])
+    {
+        HookedTable* t = FindTable(vtbl);
+        if (!(t && cur == t->rejected[idx]))
+            return cur; // runtime-installed entry (unchanged behaviour)
+    }
+    return OrigFor(This, idx);
 }
 
 // F9 toggle + (logging only) 10 s statistics and watchdog/inventory summaries.
@@ -4633,6 +4864,14 @@ static void PollFix()
         if (n > 0)
             Log("[FIX] %ld draws corrected in the last %.1f s (%.1f/s), fix %s", n, secs, n / secs,
                 g_fixRuntime ? "ON" : "OFF");
+        // v1.4.7: unconditional session counters (shadow/map hits: totals, the
+        // per-frame counters are reset by the perf statistics every 0.5 s)
+        Log("[STAT] shadow stores %ld, map hits %ld, stale drops %ld, guard hits %ld, re-arms Map %ld Unmap %ld UpdSub "
+            "%ld, foreign left alone %ld, ClassOrig fallbacks %ld, G2 scene frames %ld, gameplay frames %ld",
+            g_shadowTotal, g_mapHitTotal, static_cast<LONG>(g_fixStaleDrops), static_cast<LONG>(g_scratchGuardHits),
+            static_cast<LONG>(g_rearmCount[VT_Map]), static_cast<LONG>(g_rearmCount[VT_Unmap]),
+            static_cast<LONG>(g_rearmCount[VT_UpdateSubresource]), static_cast<LONG>(g_rearmForeign),
+            static_cast<LONG>(g_classOrigFallbacks), g_g2SceneFrames, static_cast<LONG>(g_gameplayFrames));
     }
 }
 
@@ -5903,18 +6142,34 @@ struct ClassHookSet
     const char*   fn[kMaxClassIdx];
     ClassTable    tables[kMaxClassTables];
     volatile LONG count;
+    volatile LONG fallbackLogged;   // v1.4.7: ClassOrig fallback reported (once per set)
+    volatile LONG preHookedLogged;  // v1.4.7: new table already containing our hook reported (once per set)
 };
 enum { SW_Present, SW_SetFullscreenState, SW_GetFullscreenState, SW_ResizeBuffers, SW_ResizeTarget };
 enum { DV_CreateInputLayout, DV_CreateVertexShader, DV_CreatePixelShader };
 
+// v1.4.7: two trailing 0 initialisers (fallbackLogged, preHookedLogged)
 static ClassHookSet g_factoryHooks = { "IDXGIFactory", 1, { 10, 0, 0, 0, 0 },
-                                       { "CreateSwapChain", nullptr, nullptr, nullptr, nullptr }, {}, 0 };
+                                       { "CreateSwapChain", nullptr, nullptr, nullptr, nullptr }, {}, 0, 0, 0 };
 static ClassHookSet g_swapHooks    = { "IDXGISwapChain", 5, { 8, 10, 11, 13, 14 },
                                        { "Present", "SetFullscreenState", "GetFullscreenState", "ResizeBuffers",
-                                         "ResizeTarget" }, {}, 0 };
+                                         "ResizeTarget" }, {}, 0, 0, 0 };
 static ClassHookSet g_deviceHooks  = { "ID3D11Device", 3, { 11, 12, 15, 0, 0 },
                                        { "CreateInputLayout", "CreateVertexShader", "CreatePixelShader", nullptr,
-                                         nullptr }, {}, 0 };
+                                         nullptr }, {}, 0, 0, 0 };
+
+// v1.4.7: rare path of ClassOrig - counted, reported once per set.
+static __declspec(noinline) void ClassOrigFallbackNote(ClassHookSet& s, void** vtbl, void* orig0)
+{
+    InterlockedIncrement(&g_classOrigFallbacks);
+    if (InterlockedExchange(&s.fallbackLogged, 1) != 0)
+        return;
+    EventPush("[HOOK] %s: call through unknown vtable %p - using original of table 0 (%p)", s.name,
+              static_cast<void*>(vtbl), orig0);
+    if (LoggingActive())
+        Log("[HOOK] %s: call through unknown vtable %p - using original of table 0 (%p)", s.name,
+            static_cast<void*>(vtbl), orig0);
+}
 
 static void* ClassOrig(ClassHookSet& s, void* obj, UINT k)
 {
@@ -5925,7 +6180,12 @@ static void* ClassOrig(ClassHookSet& s, void* obj, UINT k)
         if (s.tables[i].vtbl == vtbl)
             return s.tables[i].orig[k];
     }
-    return n > 0 ? s.tables[0].orig[k] : nullptr;
+    if (n > 0)
+    {
+        ClassOrigFallbackNote(s, vtbl, s.tables[0].orig[k]); // v1.4.7: diagnostics only
+        return s.tables[0].orig[k];
+    }
+    return nullptr;
 }
 
 static HMODULE ModuleOf(const void* p)
@@ -5959,6 +6219,7 @@ static void InstallClassHooks(ClassHookSet& s, void* const* hooks, void* obj, co
     bool patchedK[kMaxClassIdx] = {};
     void* origLog[kMaxClassIdx] = {};
     ClassTable* t = nullptr;
+    int preHookedK = -1; // v1.4.7: new table already contained our hook at this k
 
     AcquireSRWLockExclusive(&g_hookLock);
     const LONG n = s.count;
@@ -5992,7 +6253,11 @@ static void InstallClassHooks(ClassHookSet& s, void* const* hooks, void* obj, co
             if (cur == hooks[k])
             {
                 if (isNew)
+                {
                     t->orig[k] = n > 0 ? s.tables[0].orig[k] : nullptr;
+                    if (preHookedK < 0)
+                        preHookedK = static_cast<int>(k); // v1.4.7: reported after the lock
+                }
                 continue;
             }
             // Known table whose entry changed: re-patch only if the new entry
@@ -6047,6 +6312,26 @@ static void InstallClassHooks(ClassHookSet& s, void* const* hooks, void* obj, co
             origLog[k] = t->orig[k];
     }
     ReleaseSRWLockExclusive(&g_hookLock);
+
+    // v1.4.7: diagnostics, also with logging off (crash report event ring).
+    if (preHookedK >= 0 && InterlockedExchange(&s.preHookedLogged, 1) == 0)
+    {
+        EventPush("[HOOK] %s: new vtable %p already contains our hook at [%u] - original copied from table 0", s.name,
+                  static_cast<void*>(vtbl), s.idx[preHookedK]);
+        if (LoggingActive())
+            Log("[HOOK] %s: new vtable %p already contains our hook at [%u] - original copied from table 0", s.name,
+                static_cast<void*>(vtbl), s.idx[preHookedK]);
+    }
+    bool anyPatched = false;
+    for (UINT k = 0; k < s.n; ++k)
+        anyPatched = anyPatched || patchedK[k];
+    if (anyPatched)
+    {
+        char om[160];
+        FormatCaller(origLog[0], om, sizeof(om));
+        EventPush("[HOOK] %s %s vtbl=%p (%s) orig[0]=%s", s.name, isNew ? "new" : "existing",
+                  static_cast<void*>(vtbl), origin, om);
+    }
 
     if (!LoggingActive())
         return;
@@ -6878,24 +7163,56 @@ static void FixSetupForDevice(ID3D11Device* dev)
         ctx->Release();
 }
 
-static void OnSwapChainCreated(const char* api, HRESULT hr, const DXGI_SWAP_CHAIN_DESC* pReqDesc,
-                               IDXGISwapChain* sc)
+// v1.4.7: tiny swap chain (<= 64x64, e.g. a 2x2 capability probe of an overlay
+// or launcher) - never the game's; passed through without any hook.
+static bool IsProbeSwapDesc(const DXGI_SWAP_CHAIN_DESC* d)
 {
-    Log("[DXGI] %s hr=0x%08lX swapchain=%p", api, static_cast<unsigned long>(hr), static_cast<void*>(sc));
+    return d && d->BufferDesc.Width > 0 && d->BufferDesc.Height > 0 && d->BufferDesc.Width <= 64 &&
+           d->BufferDesc.Height <= 64;
+}
+
+// v1.4.7: new parameters caller (return address of the creating call) and
+// factoryPath (IDXGIFactory::CreateSwapChain hook; only there the probe check
+// on the actual desc applies - DoCreateDeviceAndSwapChain passes probes through
+// before OnDeviceCreated; its internal CreateSwapChain call through an already
+// hooked factory class arrives here with factoryPath = true).
+static void OnSwapChainCreated(const char* api, HRESULT hr, const DXGI_SWAP_CHAIN_DESC* pReqDesc,
+                               IDXGISwapChain* sc, void* caller, bool factoryPath)
+{
+    char callerStr[160]; // v1.4.7
+    FormatCaller(caller, callerStr, sizeof(callerStr));
+    Log("[DXGI] %s hr=0x%08lX swapchain=%p caller=%s", api, static_cast<unsigned long>(hr), static_cast<void*>(sc),
+        callerStr);
+    if (factoryPath) // v1.4.7: the device path pushes its own [DEVICE] event
+        EventPush("[DXGI] CreateSwapChain caller=%s sc=%p %ux%u", callerStr, static_cast<void*>(sc),
+                  pReqDesc ? pReqDesc->BufferDesc.Width : 0u, pReqDesc ? pReqDesc->BufferDesc.Height : 0u);
     if (pReqDesc)
         LogSwapChainDesc("requested", pReqDesc);
     if (FAILED(hr) || !sc)
         return;
-    g_gameSc = sc; // newest swap chain = game swap chain (menu target)
     HWND hwnd = pReqDesc ? pReqDesc->OutputWindow : nullptr;
     DXGI_SWAP_CHAIN_DESC actual = {};
     if (SUCCEEDED(sc->GetDesc(&actual)))
     {
         LogSwapChainDesc("actual", &actual);
+        // v1.4.7: probe swap chain via the factory - not hooked, not the game
+        // swap chain (before g_gameSc, InstallClassHooks, HudSetClear, fix CB).
+        if (factoryPath && actual.BufferDesc.Width <= 64 && actual.BufferDesc.Height <= 64)
+        {
+            // Log() already copies [DXGI] lines into the crash event ring.
+            if (LoggingActive())
+                Log("[DXGI] probe swapchain %p %ux%u (caller %s) - not hooked, not used as game swapchain",
+                    static_cast<void*>(sc), actual.BufferDesc.Width, actual.BufferDesc.Height, callerStr);
+            else
+                EventPush("[DXGI] probe swapchain %p %ux%u (caller %s) - not hooked, not used as game swapchain",
+                          static_cast<void*>(sc), actual.BufferDesc.Width, actual.BufferDesc.Height, callerStr);
+            return;
+        }
         BbNote(actual.BufferDesc.Width, actual.BufferDesc.Height);
         if (actual.OutputWindow)
             hwnd = actual.OutputWindow;
     }
+    g_gameSc = sc; // newest swap chain = game swap chain (menu target); v1.4.7: after the probe check
     if (hwnd && InterlockedExchange(&g_firstSwapChain, 1) == 0)
         QueryAndLogDpi("first swapchain", hwnd);
 
@@ -6938,12 +7255,16 @@ static void OnSwapChainCreated(const char* api, HRESULT hr, const DXGI_SWAP_CHAI
 static HRESULT STDMETHODCALLTYPE Hook_CreateSwapChain(IDXGIFactory* This, IUnknown* pDevice, DXGI_SWAP_CHAIN_DESC* pDesc,
                                                       IDXGISwapChain** ppSwapChain)
 {
+    void* const caller = _ReturnAddress(); // v1.4.7
     const TRHF_PFN_CreateSwapChain o = reinterpret_cast<TRHF_PFN_CreateSwapChain>(ClassOrig(g_factoryHooks, This, 0));
     if (!o)
         return DXGI_ERROR_INVALID_CALL; // v1.4.6
     DXGI_SWAP_CHAIN_DESC flipDesc = {};
     bool tearing = false;
-    const bool flip = g_active && !g_shutdown && PrepareFlipDesc(pDesc, &flipDesc, This, &tearing);
+    // v1.4.7: a probe swap chain (<= 64x64) is created exactly as requested
+    // (no flip desc, g_flipActive / g_tearingActive untouched).
+    const bool flip = g_active && !g_shutdown && !IsProbeSwapDesc(pDesc) &&
+                      PrepareFlipDesc(pDesc, &flipDesc, This, &tearing);
     HRESULT hr = o(This, pDevice, flip ? &flipDesc : pDesc, ppSwapChain);
     const bool flipOk = flip && SUCCEEDED(hr);
     if (flip && FAILED(hr))
@@ -6960,7 +7281,7 @@ static HRESULT STDMETHODCALLTYPE Hook_CreateSwapChain(IDXGIFactory* This, IUnkno
     }
     if (g_active && !g_shutdown)
         OnSwapChainCreated("IDXGIFactory::CreateSwapChain", hr, flipOk ? &flipDesc : pDesc,
-                           (SUCCEEDED(hr) && ppSwapChain) ? *ppSwapChain : nullptr);
+                           (SUCCEEDED(hr) && ppSwapChain) ? *ppSwapChain : nullptr, caller, true); // v1.4.7
     return hr;
 }
 
@@ -8449,9 +8770,18 @@ static void OnDeviceCreated(const char* api, HRESULT hr, IDXGIAdapter* pAdapter,
                             UINT flags, const D3D_FEATURE_LEVEL* pLevels, UINT numLevels, UINT sdkVersion,
                             const DXGI_SWAP_CHAIN_DESC* pReqDesc, IDXGISwapChain** ppSwapChain,
                             ID3D11Device** ppDevice, D3D_FEATURE_LEVEL* pFeatureLevel,
-                            ID3D11DeviceContext** ppImmediateContext)
+                            ID3D11DeviceContext** ppImmediateContext, void* caller) // v1.4.7: caller
 {
     ID3D11Device* dev = (SUCCEEDED(hr) && ppDevice) ? *ppDevice : nullptr;
+
+    // v1.4.7: caller module of the creation, always recorded for the crash report.
+    char callerStr[160];
+    FormatCaller(caller, callerStr, sizeof(callerStr));
+    if (pReqDesc)
+        EventPush("[DEVICE] %s caller=%s device=%p sc=%ux%u", api, callerStr, static_cast<void*>(dev),
+                  pReqDesc->BufferDesc.Width, pReqDesc->BufferDesc.Height);
+    else
+        EventPush("[DEVICE] %s caller=%s device=%p", api, callerStr, static_cast<void*>(dev));
 
     if (LoggingActive())
     {
@@ -8474,9 +8804,9 @@ static void OnDeviceCreated(const char* api, HRESULT hr, IDXGIAdapter* pAdapter,
                 got = dev->GetFeatureLevel();
         }
         Log("[DEVICE] %s hr=0x%08lX adapter=%p driverType=%d flags=0x%X sdk=%u requestedFL=[%s] obtainedFL=0x%X "
-            "device=%p",
+            "device=%p caller=%s", // v1.4.7: caller
             api, static_cast<unsigned long>(hr), static_cast<void*>(pAdapter), static_cast<int>(driverType), flags,
-            sdkVersion, lvl.s, static_cast<unsigned>(got), static_cast<void*>(dev));
+            sdkVersion, lvl.s, static_cast<unsigned>(got), static_cast<void*>(dev), callerStr);
     }
 
     if (!dev)
@@ -8511,7 +8841,7 @@ static void OnDeviceCreated(const char* api, HRESULT hr, IDXGIAdapter* pAdapter,
     // Frame boundaries: swap chain created together with the device, or later
     // via the factory (IDXGIFactory::CreateSwapChain hook).
     if (pReqDesc)
-        OnSwapChainCreated(api, hr, pReqDesc, ppSwapChain ? *ppSwapChain : nullptr);
+        OnSwapChainCreated(api, hr, pReqDesc, ppSwapChain ? *ppSwapChain : nullptr, caller, false); // v1.4.7
     HookFactoryFromDevice(dev);
     HookDevice(dev, api); // shader bytecode hashes + input layouts
 }
@@ -8520,7 +8850,7 @@ static HRESULT DoCreateDevice(PFN_D3D11_CREATE_DEVICE real, const char* api, IDX
                               D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags,
                               const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion,
                               ID3D11Device** ppDevice, D3D_FEATURE_LEVEL* pFeatureLevel,
-                              ID3D11DeviceContext** ppImmediateContext)
+                              ID3D11DeviceContext** ppImmediateContext, void* caller) // v1.4.7: caller
 {
     if (!real)
     {
@@ -8533,7 +8863,7 @@ static HRESULT DoCreateDevice(PFN_D3D11_CREATE_DEVICE real, const char* api, IDX
     --t_createDepth;
     if (outer && g_active && !g_shutdown)
         OnDeviceCreated(api, hr, pAdapter, DriverType, Flags, pFeatureLevels, FeatureLevels, SDKVersion, nullptr,
-                        nullptr, ppDevice, pFeatureLevel, ppImmediateContext);
+                        nullptr, ppDevice, pFeatureLevel, ppImmediateContext, caller);
     return hr;
 }
 
@@ -8542,7 +8872,8 @@ static HRESULT DoCreateDeviceAndSwapChain(PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN
                                           UINT Flags, const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels,
                                           UINT SDKVersion, const DXGI_SWAP_CHAIN_DESC* pSwapChainDesc,
                                           IDXGISwapChain** ppSwapChain, ID3D11Device** ppDevice,
-                                          D3D_FEATURE_LEVEL* pFeatureLevel, ID3D11DeviceContext** ppImmediateContext)
+                                          D3D_FEATURE_LEVEL* pFeatureLevel, ID3D11DeviceContext** ppImmediateContext,
+                                          void* caller) // v1.4.7: caller
 {
     if (!real)
     {
@@ -8550,6 +8881,26 @@ static HRESULT DoCreateDeviceAndSwapChain(PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN
         return E_FAIL;
     }
     const bool outer = (t_createDepth++ == 0);
+    // v1.4.7: probe swap chain (<= 64x64): one plain call, no flip desc, no
+    // hooks, not treated as the game device / swap chain.
+    const bool probe = outer && IsProbeSwapDesc(pSwapChainDesc);
+    if (probe)
+    {
+        const HRESULT phr = real(pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion,
+                                 pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+        --t_createDepth;
+        char callerStr[160];
+        FormatCaller(caller, callerStr, sizeof(callerStr));
+        Log("[DEVICE] D3D11CreateDeviceAndSwapChain: probe swapchain %ux%u (caller %s) hr=0x%08lX - passed through, "
+            "not hooked",
+            pSwapChainDesc->BufferDesc.Width, pSwapChainDesc->BufferDesc.Height, callerStr,
+            static_cast<unsigned long>(phr));
+        EventPush("[DEVICE] D3D11CreateDeviceAndSwapChain: probe swapchain %ux%u (caller %s) hr=0x%08lX - passed "
+                  "through, not hooked",
+                  pSwapChainDesc->BufferDesc.Width, pSwapChainDesc->BufferDesc.Height, callerStr,
+                  static_cast<unsigned long>(phr));
+        return phr;
+    }
     DXGI_SWAP_CHAIN_DESC flipDesc = {};
     bool tearing = false;
     const bool flip = outer && g_active && !g_shutdown && PrepareFlipDesc(pSwapChainDesc, &flipDesc, nullptr, &tearing);
@@ -8572,7 +8923,8 @@ static HRESULT DoCreateDeviceAndSwapChain(PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN
     --t_createDepth;
     if (outer && g_active && !g_shutdown)
         OnDeviceCreated(api, hr, pAdapter, DriverType, Flags, pFeatureLevels, FeatureLevels, SDKVersion,
-                        flipOk ? &flipDesc : pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+                        flipOk ? &flipDesc : pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext,
+                        caller); // v1.4.7
     return hr;
 }
 
@@ -8580,7 +8932,7 @@ static HRESULT DoCreateDeviceAndSwapChain(PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN
 //  PROXY (d3d11.dll): chain loading + exports
 // =============================================================================
 
-static HMODULE g_hTarget = nullptr;
+// v1.4.7: g_hTarget is declared in the crash section (crash report module info).
 static PFN_D3D11_CREATE_DEVICE g_realCreateDevice = nullptr;
 static PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN g_realCreateDeviceAndSwapChain = nullptr;
 static INIT_ONCE g_resolveOnce = INIT_ONCE_STATIC_INIT;
@@ -8836,9 +9188,11 @@ extern "C" HRESULT WINAPI Proxy_D3D11CreateDevice(IDXGIAdapter* pAdapter, D3D_DR
                                                   D3D_FEATURE_LEVEL* pFeatureLevel,
                                                   ID3D11DeviceContext** ppImmediateContext)
 {
+    void* const caller = _ReturnAddress(); // v1.4.7
     TRHF_ResolveAll();
     return DoCreateDevice(g_realCreateDevice, "D3D11CreateDevice", pAdapter, DriverType, Software, Flags,
-                          pFeatureLevels, FeatureLevels, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
+                          pFeatureLevels, FeatureLevels, SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext,
+                          caller);
 }
 
 extern "C" HRESULT WINAPI Proxy_D3D11CreateDeviceAndSwapChain(
@@ -8847,10 +9201,12 @@ extern "C" HRESULT WINAPI Proxy_D3D11CreateDeviceAndSwapChain(
     const DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, IDXGISwapChain** ppSwapChain, ID3D11Device** ppDevice,
     D3D_FEATURE_LEVEL* pFeatureLevel, ID3D11DeviceContext** ppImmediateContext)
 {
+    void* const caller = _ReturnAddress(); // v1.4.7
     TRHF_ResolveAll();
     return DoCreateDeviceAndSwapChain(g_realCreateDeviceAndSwapChain, "D3D11CreateDeviceAndSwapChain", pAdapter,
                                       DriverType, Software, Flags, pFeatureLevels, FeatureLevels, SDKVersion,
-                                      pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+                                      pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext,
+                                      caller);
 }
 
 // =============================================================================
