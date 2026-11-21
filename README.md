@@ -56,7 +56,9 @@ Fixes are applied during gameplay only; menus are never modified.
 
 That's it: **the fix is active right away, all corrections are on by default.** No setup is needed; the settings menu (**INSERT**) is optional, and **F9** turns the fix off and on for comparison.
 
-To use it together with DXVK, ReShade or another `d3d11.dll`, rename the existing file to `d3d11_orig.dll` (or `dxvk_d3d11.dll` for DXVK) before copying, or set `ProxyDll=<file name>` in `tr_hud_fix.ini`. The fix then loads it automatically (chain loading).
+To use it together with DXVK or another `d3d11.dll`, rename the existing file to `d3d11_orig.dll` (or `dxvk_d3d11.dll` for DXVK) before copying, or set `ProxyDll=<file name>` in `tr_hud_fix.ini`. The fix then loads it automatically (chain loading).
+
+**ReShade:** install ReShade as `dxgi.dll` (the default for Direct3D 10/11/12) and keep that name. Do not rename it to `d3d11_orig.dll` or load it via `ProxyDll`, the game will not start. See [Known issues](#known-issues).
 
 ### Linux / Steam Deck (Proton)
 
@@ -80,13 +82,31 @@ Delete `d3d11.dll` and `tr_hud_fix.ini` from the game folder.
 | Status | Setups |
 |---|---|
 | Tested | Steam version; 16:9 (2560x1440, 1920x1080, 1280x720), 16:10 (1680x1050), 5:4 (1280x1024), 4:3 (1024x768, 800x600); exclusive fullscreen; Steam overlay. Test system: Windows 11 26H2, AMD Radeon RX 9070 XT (driver 26.11.1) |
-| Should work (untested) | Epic and GOG version; NVIDIA / Intel GPUs; Windows 10; ultrawide 21:9 / 32:9; ReShade or DXVK via chain loading (`d3d11_orig.dll` or `ProxyDll=`); common overlays |
+| Should work (untested) | Epic and GOG version; NVIDIA / Intel GPUs; Windows 10; ultrawide 21:9 / 32:9; DXVK via chain loading (`d3d11_orig.dll` or `ProxyDll=`); common overlays |
+| Known issues | ReShade (as `dxgi.dll`); some systems where the HUD corrections do not apply, see [Known issues](#known-issues) |
 | Untested, feedback welcome | Linux / Steam Deck via Proton (launch option `WINEDLLOVERRIDES="d3d11=n,b" %command%`, see [Install](#install)) |
 | Not supported | Native Linux version (OpenGL); Microsoft Store / Game Pass *Definitive Edition* (separate port) |
 | Not recommended | Special K (it hooks Direct3D 11 itself and may conflict) |
 | ASI loaders | Do not work with this game: `TombRaider.exe` loads `version.dll`, `winmm.dll` and `dinput8.dll` from System32. Use `d3d11.dll`. |
 
 If a future game update changes the HUD shaders, the fix simply does nothing (no crash).
+
+## Known issues
+
+A test build with fixes and extra diagnostics is available: [v1.4.7-beta1](https://github.com/mythenstudios/TR2013-HUD-Fix-Plus/releases/tag/v1.4.7-beta1).
+
+**HUD corrections do not apply on some systems**
+- On some systems the game places the HUD at a slightly different internal value, so the fix does not recognize it. The menu (INSERT), the FPS limiter and the other features still work.
+- An automatic detection is planned for the next version.
+- If this affects you, please post your `tr_hud_fix.log` (see [Diagnostics](#diagnostics)).
+
+**ReShade**
+- With ReShade installed as `dxgi.dll`, the game runs, but the HUD corrections may not apply. This is being investigated.
+- Renaming ReShade to `d3d11_orig.dll` or loading it via `ProxyDll` does not work, the game does not start. Chain loading is meant for DXVK; keep ReShade as `dxgi.dll`.
+
+**Startup crash on some Windows 10 systems (1.4.6)**
+- Fixed in the test build v1.4.7-beta1.
+- With 1.4.6, ticking "Disable fullscreen optimizations" for `TombRaider.exe` (Properties > Compatibility) can help.
 
 ## How it works
 
